@@ -1,0 +1,6 @@
+streamlit
+pandas
+pydeck
+matplotlib
+folium
+streamlit-folium
