@@ -134,7 +134,7 @@ def catmull_rom_spline(points, num_segments=30):
     result.append(points[-1])
     return result
 
-# ========== 单个障碍物绕行（支持左侧/右侧/自动）==========
+# ========== 现有顺序绕行函数 ==========
 def detour_single(A, B, obs, safety_meters, side="auto"):
     minx, miny, maxx, maxy = get_bounding_box(obs["vertices"])
     expand = safety_meters / 111000.0
@@ -190,7 +190,6 @@ def sequential_detour(A, B, obstacles, flight_height, safety_meters, side="auto"
                 new_route.extend(seg_detour[1:])
         current_route = new_route
         if not conflict:
-            # 最终验证
             ok = True
             for i in range(len(current_route)-1):
                 for obs in obstacles:
@@ -226,6 +225,92 @@ def generate_detour_route(A, B, obstacles, flight_height, safety_meters, detour_
     st.warning("⚠️ 无法找到完全避障路径，请增加安全距离或调整障碍物位置")
     return [A, B]
 
+# ========== 新增：基于Dijkstra的最优路径（全局最短）==========
+def optimal_detour_route(A, B, obstacles, flight_height, safety_meters, max_attempts=3):
+    """使用图搜索（Dijkstra）寻找全局最短绕行路径，支持安全距离递增重试"""
+    relevant = [obs for obs in obstacles if flight_height < obs["height"]]
+    if not relevant:
+        return [A, B]
+
+    for attempt in range(max_attempts):
+        current_safety = safety_meters * (1 + attempt * 0.5)
+        expand = current_safety / 111000.0
+
+        # 收集候选点：起点、终点、每个障碍物扩展矩形的四个顶点
+        points = [A, B]
+        for obs in relevant:
+            minx, miny, maxx, maxy = get_bounding_box(obs["vertices"])
+            minx -= expand
+            miny -= expand
+            maxx += expand
+            maxy += expand
+            points.extend([(minx, miny), (minx, maxy), (maxx, maxy), (maxx, miny)])
+
+        # 去重（保留顺序）
+        unique = []
+        for p in points:
+            if not any(math.hypot(p[0]-q[0], p[1]-q[1]) < 1e-9 for q in unique):
+                unique.append(p)
+        points = unique
+        n = len(points)
+
+        # 构建邻接图（边存在且不穿过任何障碍物）
+        # 由于点数不多（障碍物数量少），直接用O(N^2)构建
+        graph = [[] for _ in range(n)]
+        for i in range(n):
+            for j in range(i+1, n):
+                p1 = points[i]
+                p2 = points[j]
+                safe = True
+                for obs in relevant:
+                    if polygon_intersects_segment(obs["vertices"], p1, p2):
+                        safe = False
+                        break
+                if safe:
+                    dist = math.hypot(p2[0]-p1[0], p2[1]-p1[1])
+                    graph[i].append((j, dist))
+                    graph[j].append((i, dist))
+
+        # Dijkstra
+        start_idx = points.index(A)
+        end_idx = points.index(B)
+        dist = [float('inf')] * n
+        prev = [-1] * n
+        dist[start_idx] = 0
+        visited = [False] * n
+        for _ in range(n):
+            u = -1
+            min_d = float('inf')
+            for i in range(n):
+                if not visited[i] and dist[i] < min_d:
+                    min_d = dist[i]
+                    u = i
+            if u == -1:
+                break
+            visited[u] = True
+            for v, w in graph[u]:
+                if not visited[v] and dist[u] + w < dist[v]:
+                    dist[v] = dist[u] + w
+                    prev[v] = u
+
+        if dist[end_idx] != float('inf'):
+            # 重建路径
+            path_idx = []
+            cur = end_idx
+            while cur != -1:
+                path_idx.append(cur)
+                cur = prev[cur]
+            path_idx.reverse()
+            path_pts = [points[i] for i in path_idx]
+            if len(path_pts) > 2:
+                smooth = catmull_rom_spline(path_pts, num_segments=30)
+                return smooth
+            else:
+                return path_pts
+    # 所有尝试失败，返回原始直线
+    st.warning("⚠️ 最优路径搜索失败，请增加安全距离或调整障碍物")
+    return [A, B]
+
 # ========== Streamlit 页面配置 ==========
 st.set_page_config(page_title="无人机地面站监控系统", layout="wide")
 
@@ -238,7 +323,7 @@ if "app_version" not in st.session_state:
     st.session_state.safety_distance = 3.0
     st.session_state.detour_route = None
     st.session_state.detour_side = "auto"
-    st.session_state.app_version = "v31_side_buttons"
+    st.session_state.app_version = "v32_optimal_button"
 else:
     if st.session_state.obstacles and isinstance(st.session_state.obstacles[0], list):
         new_obs = []
@@ -254,7 +339,7 @@ coord_mode = st.sidebar.radio("坐标系设置", ["WGS-84", "GCJ-02"], index=0, 
 st.sidebar.info("✅ 卫星图底图：Esri World Imagery (WGS-84)\n若选择 GCJ-02，系统会自动转换为 WGS-84 匹配卫星图。")
 
 if page == "航线规划":
-    st.header("🗺️ 航线规划 + 多障碍物可靠绕行 (左侧/右侧/自动)")
+    st.header("🗺️ 航线规划 + 多障碍物可靠绕行 (左侧/右侧/自动/最优)")
 
     st.sidebar.subheader("🚧 障碍物默认高度")
     default_h = st.sidebar.number_input(
@@ -277,9 +362,9 @@ if page == "航线规划":
     st.session_state.safety_distance = safety
     st.sidebar.divider()
 
-    st.sidebar.subheader("↪️ 全局绕行侧偏好")
+    st.sidebar.subheader("↪️ 全局绕行侧偏好（仅对下方“自动绕行”有效）")
     side_option = st.sidebar.selectbox(
-        "偏好绕行侧（用于下方第一个按钮）",
+        "偏好绕行侧",
         options=["auto", "left", "right"],
         index=["auto", "left", "right"].index(st.session_state.detour_side),
         format_func=lambda x: {"auto": "自动选择最短路径", "left": "强制从左侧绕过", "right": "强制从右侧绕过"}[x],
@@ -358,11 +443,11 @@ if page == "航线规划":
             display_lon_b, display_lat_b = lon_b, lat_b
             st.info("直接使用 WGS-84 坐标")
 
-        # ----- 三个绕行按钮 -----
-        col_btn1, col_btn2, col_btn3 = st.columns(3)
+        # ----- 四个绕行按钮 -----
+        col_btn1, col_btn2, col_btn3, col_btn4 = st.columns(4)
         with col_btn1:
             if st.button("✈️ 自动绕行", key="btn_auto", use_container_width=True):
-                with st.spinner("正在计算最优绕行路径..."):
+                with st.spinner("正在计算自动绕行路径..."):
                     A_wgs = (display_lon_a, display_lat_a)
                     B_wgs = (display_lon_b, display_lat_b)
                     route = generate_detour_route(
@@ -370,7 +455,7 @@ if page == "航线规划":
                         st.session_state.obstacles,
                         flight_height,
                         st.session_state.safety_distance,
-                        detour_side="auto"
+                        detour_side=st.session_state.detour_side
                     )
                     if len(route) == 2:
                         st.success("✅ 无冲突，无需绕行")
@@ -415,6 +500,24 @@ if page == "航线规划":
                         st.session_state.detour_route = None
                     else:
                         st.success(f"✅ 已生成右侧绕行航线，共 {len(route)} 个航点")
+                        st.session_state.detour_route = route
+                    st.rerun()
+        with col_btn4:
+            if st.button("🏆 最优路径", key="btn_optimal", use_container_width=True):
+                with st.spinner("正在计算全局最优最短路径..."):
+                    A_wgs = (display_lon_a, display_lat_a)
+                    B_wgs = (display_lon_b, display_lat_b)
+                    route = optimal_detour_route(
+                        A_wgs, B_wgs,
+                        st.session_state.obstacles,
+                        flight_height,
+                        st.session_state.safety_distance
+                    )
+                    if len(route) == 2:
+                        st.success("✅ 无冲突，无需绕行")
+                        st.session_state.detour_route = None
+                    else:
+                        st.success(f"✅ 已生成最优路径航线，共 {len(route)} 个航点")
                         st.session_state.detour_route = route
                     st.rerun()
 
