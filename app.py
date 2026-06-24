@@ -25,7 +25,6 @@ def generate_mavlink_message(seq):
     """生成一条模拟 MAVLink 报文（字典格式）"""
     msg_type = random.choice(MAVLINK_MSG_TYPES)
     now = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    # 随机微调数值以产生变化感
     if msg_type["name"] == "GLOBAL_POSITION_INT":
         lat = 324000000 + random.randint(-1000, 1000)
         lon = 1187000000 + random.randint(-1000, 1000)
@@ -264,7 +263,7 @@ def generate_detour_route(A, B, obstacles, flight_height, safety_meters, detour_
     st.warning("⚠️ 无法找到完全避障路径，请增加安全距离或调整障碍物位置")
     return [A, B]
 
-# ========== 新增：基于Dijkstra的最优路径（全局最短）==========
+# ========== Dijkstra 最优路径 ==========
 def optimal_detour_route(A, B, obstacles, flight_height, safety_meters, max_attempts=3):
     relevant = [obs for obs in obstacles if flight_height < obs["height"]]
     if not relevant:
@@ -345,6 +344,7 @@ def optimal_detour_route(A, B, obstacles, flight_height, safety_meters, max_atte
 # ========== Streamlit 页面配置 ==========
 st.set_page_config(page_title="无人机地面站监控系统", layout="wide")
 
+# ---------- 初始化所有 session_state ----------
 if "app_version" not in st.session_state:
     st.session_state.sim = HeartbeatSimulator()
     st.session_state.history = []
@@ -355,10 +355,16 @@ if "app_version" not in st.session_state:
     st.session_state.detour_route = None
     st.session_state.detour_side = "auto"
     st.session_state.fcu_online = True
-    st.session_state.monitor_active = False
-    st.session_state.mavlink_messages = []      # 新增：MAVLink 报文记录
-    st.session_state.app_version = "v34_mavlink"
+    # 监控控制相关
+    st.session_state.monitor_running = False   # 是否运行中
+    st.session_state.monitor_paused = False    # 是否暂停
+    # MAVLink 报文与位置
+    st.session_state.mavlink_messages = []
+    st.session_state.drone_position = (32.2322, 118.7490)  # 初始无人机坐标
+    st.session_state.drone_track = []                     # 飞行轨迹
+    st.session_state.app_version = "v36_final"
 else:
+    # 兼容旧版本障碍物格式（多边形列表不带高度）
     if st.session_state.obstacles and isinstance(st.session_state.obstacles[0], list):
         new_obs = []
         for poly in st.session_state.obstacles:
@@ -372,6 +378,7 @@ st.sidebar.divider()
 coord_mode = st.sidebar.radio("坐标系设置", ["WGS-84", "GCJ-02"], index=0, key="coord_radio")
 st.sidebar.info("✅ 卫星图底图：Esri World Imagery (WGS-84)\n若选择 GCJ-02，系统会自动转换为 WGS-84 匹配卫星图。")
 
+# ==================== 航线规划页面 ====================
 if page == "航线规划":
     st.header("🗺️ 航线规划 + 多障碍物可靠绕行 (左侧/右侧/自动/最优)")
 
@@ -557,7 +564,6 @@ if page == "航线规划":
         if st.button("清除绕行航线", key="clear_route"):
             st.session_state.detour_route = None
             st.rerun()
-
         if st.button("清除所有障碍物", key="clear_obs"):
             st.session_state.obstacles = []
             save_obstacles_to_file(st.session_state.obstacles)
@@ -625,104 +631,167 @@ if page == "航线规划":
                     st.success("已添加矩形障碍物")
                     st.rerun()
 
-# ========== 飞行监控（拓扑图 + MAVLink 报文）==========
+# ==================== 飞行监控页面（增强版） ====================
 elif page == "飞行监控":
-    st.header("✈️ 飞行监控 (心跳包实时状态)")
+    st.header("✈️ 飞行监控 (实时地图 + 通信状态)")
 
-    col_ctrl1, col_ctrl2, col_ctrl3 = st.columns([1, 1, 2])
+    # ---------- 控制栏与状态指示灯 ----------
+    col_ctrl1, col_ctrl2, col_ctrl3, col_ctrl4, col_ctrl5, col_ctrl6 = st.columns([1, 1, 1, 1, 1, 2])
     with col_ctrl1:
-        start_btn = st.button("▶️ 开始接收实时数据", key="monitor_start")
+        if st.button("▶️ 开始任务", key="btn_start", use_container_width=True):
+            st.session_state.monitor_running = True
+            st.session_state.monitor_paused = False
+            st.rerun()
     with col_ctrl2:
-        if st.button("⚠️ 模拟 FCU 故障", key="toggle_fcu"):
+        if st.session_state.monitor_running and not st.session_state.monitor_paused:
+            if st.button("⏸️ 暂停", key="btn_pause", use_container_width=True):
+                st.session_state.monitor_paused = True
+                st.rerun()
+        elif st.session_state.monitor_paused:
+            if st.button("▶️ 继续", key="btn_resume", use_container_width=True):
+                st.session_state.monitor_paused = False
+                st.rerun()
+        else:
+            st.button("⏸️ 暂停", key="btn_pause_disabled", disabled=True, use_container_width=True)
+    with col_ctrl3:
+        if st.button("⏹️ 停止", key="btn_stop", use_container_width=True):
+            st.session_state.monitor_running = False
+            st.session_state.monitor_paused = False
+            st.rerun()
+    with col_ctrl4:
+        if st.button("🔄 重置", key="btn_reset", use_container_width=True):
+            st.session_state.monitor_running = False
+            st.session_state.monitor_paused = False
+            st.session_state.history = []
+            st.session_state.mavlink_messages = []
+            st.session_state.drone_position = (32.2322, 118.7490)
+            st.session_state.drone_track = []
+            st.rerun()
+    with col_ctrl5:
+        if st.button("⚠️ FCU 故障", key="toggle_fcu", use_container_width=True):
             st.session_state.fcu_online = not st.session_state.fcu_online
             st.rerun()
-    with col_ctrl3:
-        st.caption("FCU 当前状态: " + ("🟢 在线" if st.session_state.fcu_online else "🔴 故障"))
+    with col_ctrl6:
+        # 状态指示灯
+        if st.session_state.monitor_running:
+            if st.session_state.monitor_paused:
+                status_color = "#FFA500"   # 橙色
+                status_text = "已暂停"
+            else:
+                status_color = "#00FF00"   # 绿色
+                status_text = "飞行中"
+        else:
+            status_color = "#808080"       # 灰色
+            status_text = "已停止"
+        st.markdown(
+            f"<div style='display:flex; align-items:center;'>"
+            f"<span style='background-color:{status_color}; width:16px; height:16px; border-radius:50%; display:inline-block; margin-right:8px;'></span>"
+            f"<span style='font-weight:bold;'>{status_text}</span>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
 
-    if start_btn:
-        st.session_state.monitor_active = True
+    # ---------- 实时地图（置于最上方） ----------
+    st.subheader("📍 无人机实时位置")
+    drone_map = folium.Map(
+        location=[st.session_state.drone_position[0], st.session_state.drone_position[1]],
+        zoom_start=17,
+        tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+        attr='Esri World Imagery',
+    )
+    # 绘制飞行轨迹
+    if len(st.session_state.drone_track) >= 2:
+        track_locs = [[lat, lon] for lat, lon in st.session_state.drone_track]
+        folium.PolyLine(
+            locations=track_locs,
+            color="yellow", weight=3, opacity=0.8,
+            popup="飞行轨迹"
+        ).add_to(drone_map)
+    # 当前位置标记
+    folium.Marker(
+        [st.session_state.drone_position[0], st.session_state.drone_position[1]],
+        popup="无人机",
+        icon=folium.Icon(color='red', icon='plane', prefix='fa')
+    ).add_to(drone_map)
+    # 动态 key 强制刷新地图（使用 app_version 或时间戳）
+    st_folium(drone_map, width=800, height=400, key="drone_live_map")
 
-    if not st.session_state.get("monitor_active", False):
-        st.info("请点击「开始接收实时数据」按钮开始模拟监控。")
-        # 离线拓扑图
-        dot = graphviz.Digraph()
-        dot.attr(rankdir='LR')
-        dot.node('GCS', 'GCS\n(地面站)', shape='box', style='filled', fillcolor='lightgrey')
-        dot.node('OBC', 'OBC\n(机载计算机)', shape='box', style='filled', fillcolor='lightgrey')
-        dot.node('FCU', 'FCU\n(飞控)', shape='box', style='filled', fillcolor='lightgrey')
-        dot.edge('GCS', 'OBC', label='未连接', color='grey', style='dashed')
-        dot.edge('OBC', 'FCU', label='未连接', color='grey', style='dashed')
-        st.graphviz_chart(dot)
-    else:
-        placeholder = st.empty()
-        # 初始化 MAVLink 报文序列号
+    # ---------- 数据更新（仅在运行且未暂停时生成新数据） ----------
+    if st.session_state.monitor_running and not st.session_state.monitor_paused:
+        packet = st.session_state.sim.generate_packet()
+        st.session_state.history.append(packet)
+
+        # 生成 MAVLink 报文
         mav_seq = len(st.session_state.mavlink_messages)
-        for _ in range(50):
-            packet = st.session_state.sim.generate_packet()
-            st.session_state.history.append(packet)
-            plot_df = pd.DataFrame(st.session_state.history[-20:])
+        mav_msg = generate_mavlink_message(mav_seq)
+        st.session_state.mavlink_messages.append(mav_msg)
+        if len(st.session_state.mavlink_messages) > 100:
+            st.session_state.mavlink_messages = st.session_state.mavlink_messages[-100:]
 
-            # 生成一条 MAVLink 模拟报文
-            mav_msg = generate_mavlink_message(mav_seq)
-            st.session_state.mavlink_messages.append(mav_msg)
-            mav_seq += 1
-            # 限制保留最近 100 条
-            if len(st.session_state.mavlink_messages) > 100:
-                st.session_state.mavlink_messages = st.session_state.mavlink_messages[-100:]
+        # 更新无人机位置（如果有位置报文）
+        if mav_msg["msg_name"] == "GLOBAL_POSITION_INT":
+            lat = mav_msg["fields"]["lat"] / 1e7
+            lon = mav_msg["fields"]["lon"] / 1e7
+            st.session_state.drone_position = (lat, lon)
+            st.session_state.drone_track.append((lat, lon))
+            if len(st.session_state.drone_track) > 20:
+                st.session_state.drone_track = st.session_state.drone_track[-20:]
 
-            with placeholder.container():
-                # 指标卡片
-                m1, m2, m3 = st.columns(3)
-                avg_rtt, loss_rate = st.session_state.sim.get_summary(st.session_state.history)
-                m1.metric("实时 RTT", f"{packet['rtt']:.3f}s",
-                          delta=packet['status'], delta_color="inverse")
-                m2.metric("平均 RTT", f"{avg_rtt:.3f}s")
-                m3.metric("累计丢包率", f"{loss_rate:.1f}%")
+    # ---------- 显示监控指标与图表 ----------
+    if st.session_state.history:
+        plot_df = pd.DataFrame(st.session_state.history[-20:])
+        m1, m2, m3 = st.columns(3)
+        avg_rtt, loss_rate = st.session_state.sim.get_summary(st.session_state.history)
+        latest = st.session_state.history[-1]
+        m1.metric("实时 RTT", f"{latest['rtt']:.3f}s",
+                  delta=latest['status'], delta_color="inverse")
+        m2.metric("平均 RTT", f"{avg_rtt:.3f}s")
+        m3.metric("累计丢包率", f"{loss_rate:.1f}%")
 
-                st.subheader("通讯延迟 (RTT) 变化曲线")
-                st.line_chart(plot_df.set_index("time")["rtt"])
+        st.subheader("通讯延迟 (RTT) 变化曲线")
+        st.line_chart(plot_df.set_index("time")["rtt"])
 
-                if packet['is_timeout']:
-                    st.error(f"警报：北京时间 {packet['time']} 发生通讯超时！")
+        if latest['is_timeout']:
+            st.error(f"警报：北京时间 {latest['time']} 发生通讯超时！")
+    else:
+        st.info("暂无监控数据，请点击「开始任务」")
 
-                # 拓扑图
-                st.subheader("📡 GCS-OBC-FCU 通信拓扑")
-                dot = graphviz.Digraph()
-                dot.attr(rankdir='LR', size='6,2')
-                gcs_color = 'lightblue'
-                obc_color = 'lightblue'
-                fcu_color = 'lightgreen' if st.session_state.fcu_online else 'lightcoral'
-                dot.node('GCS', 'GCS\n(地面站)', shape='box', style='filled', fillcolor=gcs_color)
-                dot.node('OBC', 'OBC\n(机载计算机)', shape='box', style='filled', fillcolor=obc_color)
-                dot.node('FCU', 'FCU\n(飞控)', shape='box', style='filled', fillcolor=fcu_color)
-                if packet['is_timeout']:
-                    dot.edge('GCS', 'OBC', label='超时', color='red', style='dashed', fontcolor='red')
-                else:
-                    label = f"{packet['rtt']:.3f} s"
-                    dot.edge('GCS', 'OBC', label=label, color='green', fontcolor='green')
-                if st.session_state.fcu_online:
-                    dot.edge('OBC', 'FCU', label='0.005 s', color='green', fontcolor='green')
-                else:
-                    dot.edge('OBC', 'FCU', label='中断', color='red', style='dashed', fontcolor='red')
-                st.graphviz_chart(dot, use_container_width=True)
+    # ---------- 拓扑图 ----------
+    st.subheader("📡 GCS-OBC-FCU 通信拓扑")
+    dot = graphviz.Digraph()
+    dot.attr(rankdir='LR', size='6,2')
+    gcs_color = 'lightblue'
+    obc_color = 'lightblue'
+    fcu_color = 'lightgreen' if st.session_state.fcu_online else 'lightcoral'
+    dot.node('GCS', 'GCS\n(地面站)', shape='box', style='filled', fillcolor=gcs_color)
+    dot.node('OBC', 'OBC\n(机载计算机)', shape='box', style='filled', fillcolor=obc_color)
+    dot.node('FCU', 'FCU\n(飞控)', shape='box', style='filled', fillcolor=fcu_color)
 
-                # ---------- 新增：MAVLink 报文流展示 ----------
-                with st.expander("📨 MAVLink 报文流（最近 50 条）", expanded=True):
-                    if st.session_state.mavlink_messages:
-                        # 将报文列表转为 DataFrame 以便表格显示
-                        df_msgs = pd.DataFrame(st.session_state.mavlink_messages[-50:])
-                        # 格式化 fields 列为可读字符串
-                        df_msgs["fields_str"] = df_msgs["fields"].apply(
-                            lambda f: ", ".join(f"{k}={v}" for k, v in f.items())
-                        )
-                        display_df = df_msgs[["seq", "time", "msg_name", "fields_str"]]
-                        display_df.columns = ["序号", "时间", "消息类型", "关键字段"]
-                        st.dataframe(display_df, use_container_width=True, height=300)
-                    else:
-                        st.info("暂无报文数据")
+    if st.session_state.history and not st.session_state.history[-1]['is_timeout']:
+        rtt_label = f"{st.session_state.history[-1]['rtt']:.3f} s"
+        dot.edge('GCS', 'OBC', label=rtt_label, color='green', fontcolor='green')
+    else:
+        dot.edge('GCS', 'OBC', label='超时', color='red', style='dashed', fontcolor='red')
+    if st.session_state.fcu_online:
+        dot.edge('OBC', 'FCU', label='0.005 s', color='green', fontcolor='green')
+    else:
+        dot.edge('OBC', 'FCU', label='中断', color='red', style='dashed', fontcolor='red')
+    st.graphviz_chart(dot, use_container_width=True)
 
-            time.sleep(0.4)
+    # ---------- MAVLink 报文流 ----------
+    with st.expander("📨 MAVLink 报文流（最近 50 条）", expanded=True):
+        if st.session_state.mavlink_messages:
+            df_msgs = pd.DataFrame(st.session_state.mavlink_messages[-50:])
+            df_msgs["fields_str"] = df_msgs["fields"].apply(
+                lambda f: ", ".join(f"{k}={v}" for k, v in f.items())
+            )
+            display_df = df_msgs[["seq", "time", "msg_name", "fields_str"]]
+            display_df.columns = ["序号", "时间", "消息类型", "关键字段"]
+            st.dataframe(display_df, use_container_width=True, height=300)
+        else:
+            st.info("暂无报文数据")
 
-        # 循环结束后重置
-        st.session_state.monitor_active = False
+    # ---------- 循环驱动：若运行中则定时重新运行脚本 ----------
+    if st.session_state.monitor_running:
+        time.sleep(0.4)   # 控制刷新频率
         st.rerun()
