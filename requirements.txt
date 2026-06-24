@@ -4,3 +4,4 @@ pydeck
 matplotlib
 folium
 streamlit-folium
+graphviz
