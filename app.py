@@ -8,6 +8,7 @@ from heartbeat_sim import HeartbeatSimulator
 import math
 import json
 import os
+import graphviz  # 新增拓扑图库
 
 # ========== 障碍物持久化 ==========
 OBSTACLE_FILE = "obstacles.json"
@@ -227,7 +228,6 @@ def generate_detour_route(A, B, obstacles, flight_height, safety_meters, detour_
 
 # ========== 新增：基于Dijkstra的最优路径（全局最短）==========
 def optimal_detour_route(A, B, obstacles, flight_height, safety_meters, max_attempts=3):
-    """使用图搜索（Dijkstra）寻找全局最短绕行路径，支持安全距离递增重试"""
     relevant = [obs for obs in obstacles if flight_height < obs["height"]]
     if not relevant:
         return [A, B]
@@ -236,7 +236,6 @@ def optimal_detour_route(A, B, obstacles, flight_height, safety_meters, max_atte
         current_safety = safety_meters * (1 + attempt * 0.5)
         expand = current_safety / 111000.0
 
-        # 收集候选点：起点、终点、每个障碍物扩展矩形的四个顶点
         points = [A, B]
         for obs in relevant:
             minx, miny, maxx, maxy = get_bounding_box(obs["vertices"])
@@ -246,7 +245,6 @@ def optimal_detour_route(A, B, obstacles, flight_height, safety_meters, max_atte
             maxy += expand
             points.extend([(minx, miny), (minx, maxy), (maxx, maxy), (maxx, miny)])
 
-        # 去重（保留顺序）
         unique = []
         for p in points:
             if not any(math.hypot(p[0]-q[0], p[1]-q[1]) < 1e-9 for q in unique):
@@ -254,8 +252,6 @@ def optimal_detour_route(A, B, obstacles, flight_height, safety_meters, max_atte
         points = unique
         n = len(points)
 
-        # 构建邻接图（边存在且不穿过任何障碍物）
-        # 由于点数不多（障碍物数量少），直接用O(N^2)构建
         graph = [[] for _ in range(n)]
         for i in range(n):
             for j in range(i+1, n):
@@ -271,7 +267,6 @@ def optimal_detour_route(A, B, obstacles, flight_height, safety_meters, max_atte
                     graph[i].append((j, dist))
                     graph[j].append((i, dist))
 
-        # Dijkstra
         start_idx = points.index(A)
         end_idx = points.index(B)
         dist = [float('inf')] * n
@@ -294,7 +289,6 @@ def optimal_detour_route(A, B, obstacles, flight_height, safety_meters, max_atte
                     prev[v] = u
 
         if dist[end_idx] != float('inf'):
-            # 重建路径
             path_idx = []
             cur = end_idx
             while cur != -1:
@@ -307,7 +301,6 @@ def optimal_detour_route(A, B, obstacles, flight_height, safety_meters, max_atte
                 return smooth
             else:
                 return path_pts
-    # 所有尝试失败，返回原始直线
     st.warning("⚠️ 最优路径搜索失败，请增加安全距离或调整障碍物")
     return [A, B]
 
@@ -323,7 +316,9 @@ if "app_version" not in st.session_state:
     st.session_state.safety_distance = 3.0
     st.session_state.detour_route = None
     st.session_state.detour_side = "auto"
-    st.session_state.app_version = "v32_optimal_button"
+    st.session_state.fcu_online = True           # 新增：FCU 在线状态
+    st.session_state.monitor_active = False       # 新增：监控激活标志
+    st.session_state.app_version = "v33_topology"
 else:
     if st.session_state.obstacles and isinstance(st.session_state.obstacles[0], list):
         new_obs = []
@@ -592,24 +587,96 @@ if page == "航线规划":
                     st.success("已添加矩形障碍物")
                     st.rerun()
 
+# ========== 飞行监控（新增拓扑图）==========
 elif page == "飞行监控":
     st.header("✈️ 飞行监控 (心跳包实时状态)")
-    placeholder = st.empty()
-    if st.button("开始接收实时数据", key="monitor_start"):
+
+    # 新增控制按钮（开始监控 + 模拟 FCU 故障）
+    col_ctrl1, col_ctrl2, col_ctrl3 = st.columns([1, 1, 2])
+    with col_ctrl1:
+        start_btn = st.button("▶️ 开始接收实时数据", key="monitor_start")
+    with col_ctrl2:
+        if st.button("⚠️ 模拟 FCU 故障", key="toggle_fcu"):
+            st.session_state.fcu_online = not st.session_state.fcu_online
+            st.rerun()
+    with col_ctrl3:
+        st.caption("FCU 当前状态: " + ("🟢 在线" if st.session_state.fcu_online else "🔴 故障"))
+
+    # 激活监控循环
+    if start_btn:
+        st.session_state.monitor_active = True
+
+    if not st.session_state.get("monitor_active", False):
+        st.info("请点击「开始接收实时数据」按钮开始模拟监控。")
+        # 显示离线拓扑图
+        dot = graphviz.Digraph()
+        dot.attr(rankdir='LR')
+        dot.node('GCS', 'GCS\n(地面站)', shape='box', style='filled', fillcolor='lightgrey')
+        dot.node('OBC', 'OBC\n(机载计算机)', shape='box', style='filled', fillcolor='lightgrey')
+        dot.node('FCU', 'FCU\n(飞控)', shape='box', style='filled', fillcolor='lightgrey')
+        dot.edge('GCS', 'OBC', label='未连接', color='grey', style='dashed')
+        dot.edge('OBC', 'FCU', label='未连接', color='grey', style='dashed')
+        st.graphviz_chart(dot)
+    else:
+        placeholder = st.empty()
         for _ in range(50):
             packet = st.session_state.sim.generate_packet()
             st.session_state.history.append(packet)
             plot_df = pd.DataFrame(st.session_state.history[-20:])
+
             with placeholder.container():
+                # 指标卡片
                 m1, m2, m3 = st.columns(3)
                 avg_rtt, loss_rate = st.session_state.sim.get_summary(st.session_state.history)
-                m1.metric("实时 RTT", f"{packet['rtt']:.3f}s", delta=packet['status'], delta_color="inverse")
+                m1.metric("实时 RTT", f"{packet['rtt']:.3f}s",
+                          delta=packet['status'], delta_color="inverse")
                 m2.metric("平均 RTT", f"{avg_rtt:.3f}s")
                 m3.metric("累计丢包率", f"{loss_rate:.1f}%")
+
                 st.subheader("通讯延迟 (RTT) 变化曲线")
                 st.line_chart(plot_df.set_index("time")["rtt"])
+
                 if packet['is_timeout']:
                     st.error(f"警报：北京时间 {packet['time']} 发生通讯超时！")
+
+                # ---------- 新增拓扑图 ----------
+                st.subheader("📡 GCS-OBC-FCU 通信拓扑")
+                dot = graphviz.Digraph()
+                dot.attr(rankdir='LR', size='6,2')
+
+                # 节点颜色
+                gcs_color = 'lightblue'
+                obc_color = 'lightblue'
+                fcu_color = 'lightgreen' if st.session_state.fcu_online else 'lightcoral'
+
+                dot.node('GCS', 'GCS\n(地面站)', shape='box',
+                         style='filled', fillcolor=gcs_color)
+                dot.node('OBC', 'OBC\n(机载计算机)', shape='box',
+                         style='filled', fillcolor=obc_color)
+                dot.node('FCU', 'FCU\n(飞控)', shape='box',
+                         style='filled', fillcolor=fcu_color)
+
+                # GCS-OBC 边
+                if packet['is_timeout']:
+                    dot.edge('GCS', 'OBC', label='超时', color='red',
+                             style='dashed', fontcolor='red')
+                else:
+                    label = f"{packet['rtt']:.3f} s"
+                    dot.edge('GCS', 'OBC', label=label, color='green',
+                             fontcolor='green')
+
+                # OBC-FCU 边
+                if st.session_state.fcu_online:
+                    dot.edge('OBC', 'FCU', label='0.005 s', color='green',
+                             fontcolor='green')
+                else:
+                    dot.edge('OBC', 'FCU', label='中断', color='red',
+                             style='dashed', fontcolor='red')
+
+                st.graphviz_chart(dot, use_container_width=True)
+
             time.sleep(0.4)
-    else:
-        st.info("请点击按钮开始模拟监控。")
+
+        # 循环结束后重置状态
+        st.session_state.monitor_active = False
+        st.rerun()
