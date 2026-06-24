@@ -25,7 +25,6 @@ def generate_mavlink_message(seq):
     """生成一条模拟 MAVLink 报文（字典格式）"""
     msg_type = random.choice(MAVLINK_MSG_TYPES)
     now = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    # 随机微调数值以产生变化感
     if msg_type["name"] == "GLOBAL_POSITION_INT":
         lat = 324000000 + random.randint(-1000, 1000)
         lon = 1187000000 + random.randint(-1000, 1000)
@@ -264,7 +263,7 @@ def generate_detour_route(A, B, obstacles, flight_height, safety_meters, detour_
     st.warning("⚠️ 无法找到完全避障路径，请增加安全距离或调整障碍物位置")
     return [A, B]
 
-# ========== 新增：基于Dijkstra的最优路径（全局最短）==========
+# ========== Dijkstra 最优路径 ==========
 def optimal_detour_route(A, B, obstacles, flight_height, safety_meters, max_attempts=3):
     relevant = [obs for obs in obstacles if flight_height < obs["height"]]
     if not relevant:
@@ -356,8 +355,11 @@ if "app_version" not in st.session_state:
     st.session_state.detour_side = "auto"
     st.session_state.fcu_online = True
     st.session_state.monitor_active = False
-    st.session_state.mavlink_messages = []      # 新增：MAVLink 报文记录
-    st.session_state.app_version = "v34_mavlink"
+    st.session_state.mavlink_messages = []
+    # 实时地图状态
+    st.session_state.drone_position = (32.2322, 118.7490)  # 初始位置（起点附近）
+    st.session_state.drone_track = []                     # 轨迹列表
+    st.session_state.app_version = "v35_realtimemap"
 else:
     if st.session_state.obstacles and isinstance(st.session_state.obstacles[0], list):
         new_obs = []
@@ -372,6 +374,7 @@ st.sidebar.divider()
 coord_mode = st.sidebar.radio("坐标系设置", ["WGS-84", "GCJ-02"], index=0, key="coord_radio")
 st.sidebar.info("✅ 卫星图底图：Esri World Imagery (WGS-84)\n若选择 GCJ-02，系统会自动转换为 WGS-84 匹配卫星图。")
 
+# ========== 航线规划页面（不变） ==========
 if page == "航线规划":
     st.header("🗺️ 航线规划 + 多障碍物可靠绕行 (左侧/右侧/自动/最优)")
 
@@ -557,7 +560,6 @@ if page == "航线规划":
         if st.button("清除绕行航线", key="clear_route"):
             st.session_state.detour_route = None
             st.rerun()
-
         if st.button("清除所有障碍物", key="clear_obs"):
             st.session_state.obstacles = []
             save_obstacles_to_file(st.session_state.obstacles)
@@ -625,7 +627,7 @@ if page == "航线规划":
                     st.success("已添加矩形障碍物")
                     st.rerun()
 
-# ========== 飞行监控（拓扑图 + MAVLink 报文）==========
+# ========== 飞行监控（拓扑图 + MAVLink 报文 + 实时地图）==========
 elif page == "飞行监控":
     st.header("✈️ 飞行监控 (心跳包实时状态)")
 
@@ -655,20 +657,30 @@ elif page == "飞行监控":
         st.graphviz_chart(dot)
     else:
         placeholder = st.empty()
-        # 初始化 MAVLink 报文序列号
         mav_seq = len(st.session_state.mavlink_messages)
+        frame_count = 0  # 用于地图 key 刷新
+
         for _ in range(50):
             packet = st.session_state.sim.generate_packet()
             st.session_state.history.append(packet)
             plot_df = pd.DataFrame(st.session_state.history[-20:])
 
-            # 生成一条 MAVLink 模拟报文
+            # 生成 MAVLink 报文并更新无人机位置
             mav_msg = generate_mavlink_message(mav_seq)
             st.session_state.mavlink_messages.append(mav_msg)
             mav_seq += 1
-            # 限制保留最近 100 条
             if len(st.session_state.mavlink_messages) > 100:
                 st.session_state.mavlink_messages = st.session_state.mavlink_messages[-100:]
+
+            # 如果报文是 GLOBAL_POSITION_INT，提取经纬度更新位置和轨迹
+            if mav_msg["msg_name"] == "GLOBAL_POSITION_INT":
+                lat = mav_msg["fields"]["lat"] / 1e7
+                lon = mav_msg["fields"]["lon"] / 1e7
+                st.session_state.drone_position = (lat, lon)
+                # 添加轨迹点（保持最新20个）
+                st.session_state.drone_track.append((lat, lon))
+                if len(st.session_state.drone_track) > 20:
+                    st.session_state.drone_track = st.session_state.drone_track[-20:]
 
             with placeholder.container():
                 # 指标卡片
@@ -706,12 +718,10 @@ elif page == "飞行监控":
                     dot.edge('OBC', 'FCU', label='中断', color='red', style='dashed', fontcolor='red')
                 st.graphviz_chart(dot, use_container_width=True)
 
-                # ---------- 新增：MAVLink 报文流展示 ----------
+                # MAVLink 报文流
                 with st.expander("📨 MAVLink 报文流（最近 50 条）", expanded=True):
                     if st.session_state.mavlink_messages:
-                        # 将报文列表转为 DataFrame 以便表格显示
                         df_msgs = pd.DataFrame(st.session_state.mavlink_messages[-50:])
-                        # 格式化 fields 列为可读字符串
                         df_msgs["fields_str"] = df_msgs["fields"].apply(
                             lambda f: ", ".join(f"{k}={v}" for k, v in f.items())
                         )
@@ -720,6 +730,33 @@ elif page == "飞行监控":
                         st.dataframe(display_df, use_container_width=True, height=300)
                     else:
                         st.info("暂无报文数据")
+
+                # ---------- 新增实时地图 ----------
+                st.subheader("📍 无人机实时位置")
+                drone_map = folium.Map(
+                    location=[st.session_state.drone_position[0], st.session_state.drone_position[1]],
+                    zoom_start=17,
+                    tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+                    attr='Esri World Imagery',
+                )
+                # 绘制轨迹（如果有2个以上点）
+                if len(st.session_state.drone_track) >= 2:
+                    track_locs = [[lat, lon] for lat, lon in st.session_state.drone_track]
+                    folium.PolyLine(
+                        locations=track_locs,
+                        color="yellow", weight=3, opacity=0.8,
+                        popup="飞行轨迹"
+                    ).add_to(drone_map)
+                # 绘制当前位置标记
+                folium.Marker(
+                    [st.session_state.drone_position[0], st.session_state.drone_position[1]],
+                    popup="无人机",
+                    icon=folium.Icon(color='red', icon='plane', prefix='fa')
+                ).add_to(drone_map)
+
+                # 使用时间戳 key 强制刷新地图
+                st_folium(drone_map, width=800, height=400, key=f"drone_map_{frame_count}")
+                frame_count += 1
 
             time.sleep(0.4)
 
