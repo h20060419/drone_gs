@@ -784,11 +784,16 @@ elif page == "飞行监控":
         packet = st.session_state.sim.generate_packet()
         st.session_state.history.append(packet)
 
-    # ====== 实时地图 ======
+   # ====== 实时地图 ======
     st.subheader("📍 实时飞行地图")
+    # 确定地图中心点——任务运行时固定，不再跟随飞机
     if st.session_state.task_route is not None:
         route_latlng = [(lat, lng) for lng, lat in st.session_state.task_route]
-        map_center = [st.session_state.current_position[0], st.session_state.current_position[1]]
+        # 固定使用航线起点作为地图中心（避免每次重绘跳动）
+        map_center = [route_latlng[0][0], route_latlng[0][1]]
+        # 也可改为使用航线几何中心：
+        # lats = [p[0] for p in route_latlng]; lngs = [p[1] for p in route_latlng]
+        # map_center = [sum(lats)/len(lats), sum(lngs)/len(lngs)]
     else:
         route_latlng = []
         map_center = [32.2322, 118.7490]
