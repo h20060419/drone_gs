@@ -1,17 +1,42 @@
 import streamlit as st
 import pandas as pd
 import time
-import folium
-from folium.plugins import Draw
-from streamlit_folium import st_folium
-from heartbeat_sim import HeartbeatSimulator
 import math
 import json
 import os
+import folium
+from folium.plugins import Draw
+from streamlit_folium import st_folium
+from heartbeat_sim import HeartbeatSimulator  # 假设您有此模块
+import graphviz
 
-# ========== 障碍物持久化 ==========
+# ========== 页面配置 ==========
+st.set_page_config(page_title="无人机地面站监控系统", layout="wide")
+
+# ========== 持久化与状态初始化 ==========
 OBSTACLE_FILE = "obstacles.json"
 
+if "app_version" not in st.session_state:
+    st.session_state.sim = HeartbeatSimulator()
+    st.session_state.history = []
+    loaded = load_obstacles_from_file() if 'load_obstacles_from_file' in globals() else []
+    st.session_state.obstacles = loaded if loaded else []
+    st.session_state.default_obstacle_height = 30.0
+    st.session_state.safety_distance = 3.0
+    st.session_state.detour_route = None
+    st.session_state.detour_side = "auto"
+    st.session_state.mav_messages = []  # 存储 MAVLink 模拟报文
+    st.session_state.topology_status = {"gcs_obc": "up", "obc_fcu": "up"}
+    st.session_state.app_version = "v33_full_suite"
+else:
+    if st.session_state.obstacles and isinstance(st.session_state.obstacles[0], list):
+        new_obs = []
+        for poly in st.session_state.obstacles:
+            new_obs.append({"vertices": poly, "height": 30.0})
+        st.session_state.obstacles = new_obs
+        save_obstacles_to_file(st.session_state.obstacles)
+
+# ========== 障碍物持久化函数 ==========
 def save_obstacles_to_file(obstacles):
     try:
         with open(OBSTACLE_FILE, 'w', encoding='utf-8') as f:
@@ -134,16 +159,25 @@ def catmull_rom_spline(points, num_segments=30):
     result.append(points[-1])
     return result
 
-# ========== 现有顺序绕行函数 ==========
+# ========== 安全距离转换（修复经度缩放）==========
+def meters_to_lng_deg(meters, lat):
+    return meters / (111320.0 * math.cos(math.radians(lat)))
+
+def meters_to_lat_deg(meters):
+    return meters / 110540.0
+
+# ========== 绕行函数（沿用原有逻辑但使用修正的安全距离）==========
 def detour_single(A, B, obs, safety_meters, side="auto"):
     minx, miny, maxx, maxy = get_bounding_box(obs["vertices"])
-    expand = safety_meters / 111000.0
-    minx -= expand
-    miny -= expand
-    maxx += expand
-    maxy += expand
+    avg_lat = (miny + maxy) / 2.0
+    expand_lng = meters_to_lng_deg(safety_meters, avg_lat)
+    expand_lat = meters_to_lat_deg(safety_meters)
+    minx -= expand_lng
+    miny -= expand_lat
+    maxx += expand_lng
+    maxy += expand_lat
     rect_pts = [(minx, miny), (minx, maxy), (maxx, maxy), (maxx, miny)]
-    
+
     if side == "left":
         p1, p2 = rect_pts[0], rect_pts[1]
         if math.hypot(p1[0]-A[0], p1[1]-A[1]) > math.hypot(p2[0]-A[0], p2[1]-A[1]):
@@ -225,28 +259,25 @@ def generate_detour_route(A, B, obstacles, flight_height, safety_meters, detour_
     st.warning("⚠️ 无法找到完全避障路径，请增加安全距离或调整障碍物位置")
     return [A, B]
 
-# ========== 新增：基于Dijkstra的最优路径（全局最短）==========
 def optimal_detour_route(A, B, obstacles, flight_height, safety_meters, max_attempts=3):
-    """使用图搜索（Dijkstra）寻找全局最短绕行路径，支持安全距离递增重试"""
     relevant = [obs for obs in obstacles if flight_height < obs["height"]]
     if not relevant:
         return [A, B]
 
     for attempt in range(max_attempts):
         current_safety = safety_meters * (1 + attempt * 0.5)
-        expand = current_safety / 111000.0
-
-        # 收集候选点：起点、终点、每个障碍物扩展矩形的四个顶点
         points = [A, B]
         for obs in relevant:
             minx, miny, maxx, maxy = get_bounding_box(obs["vertices"])
-            minx -= expand
-            miny -= expand
-            maxx += expand
-            maxy += expand
+            avg_lat = (miny + maxy) / 2.0
+            expand_lng = meters_to_lng_deg(current_safety, avg_lat)
+            expand_lat = meters_to_lat_deg(current_safety)
+            minx -= expand_lng
+            miny -= expand_lat
+            maxx += expand_lng
+            maxy += expand_lat
             points.extend([(minx, miny), (minx, maxy), (maxx, maxy), (maxx, miny)])
 
-        # 去重（保留顺序）
         unique = []
         for p in points:
             if not any(math.hypot(p[0]-q[0], p[1]-q[1]) < 1e-9 for q in unique):
@@ -254,8 +285,6 @@ def optimal_detour_route(A, B, obstacles, flight_height, safety_meters, max_atte
         points = unique
         n = len(points)
 
-        # 构建邻接图（边存在且不穿过任何障碍物）
-        # 由于点数不多（障碍物数量少），直接用O(N^2)构建
         graph = [[] for _ in range(n)]
         for i in range(n):
             for j in range(i+1, n):
@@ -271,7 +300,6 @@ def optimal_detour_route(A, B, obstacles, flight_height, safety_meters, max_atte
                     graph[i].append((j, dist))
                     graph[j].append((i, dist))
 
-        # Dijkstra
         start_idx = points.index(A)
         end_idx = points.index(B)
         dist = [float('inf')] * n
@@ -294,7 +322,6 @@ def optimal_detour_route(A, B, obstacles, flight_height, safety_meters, max_atte
                     prev[v] = u
 
         if dist[end_idx] != float('inf'):
-            # 重建路径
             path_idx = []
             cur = end_idx
             while cur != -1:
@@ -307,37 +334,70 @@ def optimal_detour_route(A, B, obstacles, flight_height, safety_meters, max_atte
                 return smooth
             else:
                 return path_pts
-    # 所有尝试失败，返回原始直线
     st.warning("⚠️ 最优路径搜索失败，请增加安全距离或调整障碍物")
     return [A, B]
 
-# ========== Streamlit 页面配置 ==========
-st.set_page_config(page_title="无人机地面站监控系统", layout="wide")
+# ========== 通信链路模拟函数 ==========
+def simulate_mavlink_message():
+    """生成模拟的 MAVLink 报文，用于演示"""
+    import random
+    msg_types = ["HEARTBEAT", "GLOBAL_POSITION_INT", "ATTITUDE", "SYS_STATUS", "BATTERY_STATUS"]
+    msg_type = random.choice(msg_types)
+    raw_hex = "fe 09 00 00 00 01 01 00 00 00 00 00 00 00"  # 仅示意
+    fields = {
+        "type": msg_type,
+        "time_boot_ms": random.randint(1000, 5000),
+        "lat": 32.23 + random.uniform(-0.01, 0.01),
+        "lon": 118.75 + random.uniform(-0.01, 0.01),
+        "alt": random.uniform(50, 100),
+        "roll": random.uniform(-30, 30),
+        "pitch": random.uniform(-20, 20),
+        "yaw": random.uniform(0, 360),
+        "voltage_battery": random.uniform(11.1, 12.6),
+        "drop_rate_comm": 0,
+    }
+    return {
+        "time": time.strftime("%H:%M:%S"),
+        "type": msg_type,
+        "raw": raw_hex,
+        "fields": fields
+    }
 
-if "app_version" not in st.session_state:
-    st.session_state.sim = HeartbeatSimulator()
-    st.session_state.history = []
-    loaded = load_obstacles_from_file()
-    st.session_state.obstacles = loaded if loaded else []
-    st.session_state.default_obstacle_height = 30.0
-    st.session_state.safety_distance = 3.0
-    st.session_state.detour_route = None
-    st.session_state.detour_side = "auto"
-    st.session_state.app_version = "v32_optimal_button"
-else:
-    if st.session_state.obstacles and isinstance(st.session_state.obstacles[0], list):
-        new_obs = []
-        for poly in st.session_state.obstacles:
-            new_obs.append({"vertices": poly, "height": 30.0})
-        st.session_state.obstacles = new_obs
-        save_obstacles_to_file(st.session_state.obstacles)
+def update_topology_status():
+    """根据最新报文模拟链路状态"""
+    if st.session_state.mav_messages:
+        # 简单随机模拟：偶尔链路抖动
+        import random
+        if random.random() < 0.9:
+            st.session_state.topology_status = {"gcs_obc": "up", "obc_fcu": "up"}
+        else:
+            st.session_state.topology_status["obc_fcu"] = "down" if random.random() < 0.5 else "up"
+            st.session_state.topology_status["gcs_obc"] = "up" if random.random() < 0.8 else "down"
 
+def render_topology():
+    """绘制 GCS-OBC-FCU 拓扑图"""
+    status = st.session_state.topology_status
+    dot = graphviz.Digraph(comment='通信链路拓扑')
+    dot.attr(rankdir='LR')
+    dot.node('GCS', '🌍 GCS\n(地面站)', shape='box', style='filled', fillcolor='lightblue')
+    dot.node('OBC', '💻 OBC\n(树莓派)', shape='box', style='filled', fillcolor='lightyellow')
+    dot.node('FCU', '✈️ FCU\n(Pixhawk)', shape='box', style='filled', fillcolor='lightgreen')
+    
+    gcs_obc_color = 'green' if status['gcs_obc'] == 'up' else 'red'
+    obc_fcu_color = 'green' if status['obc_fcu'] == 'up' else 'red'
+    
+    dot.edge('GCS', 'OBC', label='4G/5G', color=gcs_obc_color, penwidth='2.0')
+    dot.edge('OBC', 'FCU', label='UART/USB', color=obc_fcu_color, penwidth='2.0')
+    return dot
+
+# ========== 侧边栏导航 ==========
 st.sidebar.title("🧭 导航控制")
-page = st.sidebar.radio("请选择功能页面", ["航线规划", "飞行监控"], key="page_radio")
+page = st.sidebar.radio("请选择功能页面", ["航线规划", "飞行监控", "通信链路"], key="page_radio")
 st.sidebar.divider()
 coord_mode = st.sidebar.radio("坐标系设置", ["WGS-84", "GCJ-02"], index=0, key="coord_radio")
 st.sidebar.info("✅ 卫星图底图：Esri World Imagery (WGS-84)\n若选择 GCJ-02，系统会自动转换为 WGS-84 匹配卫星图。")
 
+# ========== 航线规划页面 ==========
 if page == "航线规划":
     st.header("🗺️ 航线规划 + 多障碍物可靠绕行 (左侧/右侧/自动/最优)")
 
@@ -443,7 +503,6 @@ if page == "航线规划":
             display_lon_b, display_lat_b = lon_b, lat_b
             st.info("直接使用 WGS-84 坐标")
 
-        # ----- 四个绕行按钮 -----
         col_btn1, col_btn2, col_btn3, col_btn4 = st.columns(4)
         with col_btn1:
             if st.button("✈️ 自动绕行", key="btn_auto", use_container_width=True):
@@ -592,11 +651,27 @@ if page == "航线规划":
                     st.success("已添加矩形障碍物")
                     st.rerun()
 
+# ========== 飞行监控页面 ==========
 elif page == "飞行监控":
     st.header("✈️ 飞行监控 (心跳包实时状态)")
     placeholder = st.empty()
-    if st.button("开始接收实时数据", key="monitor_start"):
-        for _ in range(50):
+    col_start, col_stop = st.columns(2)
+    with col_start:
+        start_monitor = st.button("开始接收实时数据", key="monitor_start")
+    with col_stop:
+        stop_monitor = st.button("停止监控", key="monitor_stop")
+    
+    if 'monitor_active' not in st.session_state:
+        st.session_state.monitor_active = False
+
+    if start_monitor:
+        st.session_state.monitor_active = True
+    if stop_monitor:
+        st.session_state.monitor_active = False
+
+    if st.session_state.monitor_active:
+        status_text = st.empty()
+        while st.session_state.monitor_active:
             packet = st.session_state.sim.generate_packet()
             st.session_state.history.append(packet)
             plot_df = pd.DataFrame(st.session_state.history[-20:])
@@ -611,5 +686,53 @@ elif page == "飞行监控":
                 if packet['is_timeout']:
                     st.error(f"警报：北京时间 {packet['time']} 发生通讯超时！")
             time.sleep(0.4)
+            # 刷新状态文字，否则循环卡死
+            status_text.text(f"监控中... 最后更新: {packet['time']}")
+        st.session_state.monitor_active = False
+        st.rerun()
     else:
         st.info("请点击按钮开始模拟监控。")
+
+# ========== 通信链路页面 ==========
+elif page == "通信链路":
+    st.header("📡 通信链路监控 (GCS-OBC-FCU)")
+    
+    col_left, col_right = st.columns([1, 1])
+    with col_left:
+        st.subheader("拓扑图")
+        topo_placeholder = st.empty()
+        if st.button("刷新拓扑状态"):
+            update_topology_status()
+        topo_placeholder.graphviz_chart(render_topology())
+        st.caption("绿色连线表示链路正常，红色表示中断")
+    
+    with col_right:
+        st.subheader("MAVLink 报文模拟")
+        if st.button("生成一条模拟报文"):
+            msg = simulate_mavlink_message()
+            st.session_state.mav_messages.append(msg)
+            update_topology_status()
+        
+        if st.button("清空报文"):
+            st.session_state.mav_messages = []
+        
+        if st.session_state.mav_messages:
+            # 统计面板
+            df = pd.DataFrame(st.session_state.mav_messages)
+            st.metric("总报文数", len(df))
+            
+            # 消息类型统计
+            type_counts = df['type'].value_counts()
+            st.bar_chart(type_counts)
+            
+            # 最新报文表格
+            st.subheader("最新20条报文")
+            show_df = df[['time', 'type', 'raw']].tail(20)
+            st.dataframe(show_df, use_container_width=True)
+            
+            # 字段解析
+            if st.checkbox("显示详细字段（最新一条）"):
+                latest = st.session_state.mav_messages[-1]
+                st.json(latest['fields'])
+        else:
+            st.info("暂无报文，请点击生成模拟报文。")
