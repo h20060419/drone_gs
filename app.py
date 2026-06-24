@@ -25,6 +25,7 @@ def generate_mavlink_message(seq):
     """生成一条模拟 MAVLink 报文（字典格式）"""
     msg_type = random.choice(MAVLINK_MSG_TYPES)
     now = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    # 随机微调数值以产生变化感
     if msg_type["name"] == "GLOBAL_POSITION_INT":
         lat = 324000000 + random.randint(-1000, 1000)
         lon = 1187000000 + random.randint(-1000, 1000)
@@ -263,7 +264,7 @@ def generate_detour_route(A, B, obstacles, flight_height, safety_meters, detour_
     st.warning("⚠️ 无法找到完全避障路径，请增加安全距离或调整障碍物位置")
     return [A, B]
 
-# ========== Dijkstra 最优路径 ==========
+# ========== 新增：基于Dijkstra的最优路径（全局最短）==========
 def optimal_detour_route(A, B, obstacles, flight_height, safety_meters, max_attempts=3):
     relevant = [obs for obs in obstacles if flight_height < obs["height"]]
     if not relevant:
@@ -344,7 +345,6 @@ def optimal_detour_route(A, B, obstacles, flight_height, safety_meters, max_atte
 # ========== Streamlit 页面配置 ==========
 st.set_page_config(page_title="无人机地面站监控系统", layout="wide")
 
-# ---------- 初始化 session_state ----------
 if "app_version" not in st.session_state:
     st.session_state.sim = HeartbeatSimulator()
     st.session_state.history = []
@@ -355,16 +355,10 @@ if "app_version" not in st.session_state:
     st.session_state.detour_route = None
     st.session_state.detour_side = "auto"
     st.session_state.fcu_online = True
-    # 监控控制状态
-    st.session_state.monitor_running = False
-    st.session_state.monitor_paused = False
-    # MAVLink 与实时地图
-    st.session_state.mavlink_messages = []
-    st.session_state.drone_position = (32.2322, 118.7490)  # 初始坐标
-    st.session_state.drone_track = []
-    st.session_state.app_version = "v36_realtimemap_controls"
+    st.session_state.monitor_active = False
+    st.session_state.mavlink_messages = []      # 新增：MAVLink 报文记录
+    st.session_state.app_version = "v34_mavlink"
 else:
-    # 旧版本障碍物格式迁移（保留）
     if st.session_state.obstacles and isinstance(st.session_state.obstacles[0], list):
         new_obs = []
         for poly in st.session_state.obstacles:
@@ -378,174 +372,357 @@ st.sidebar.divider()
 coord_mode = st.sidebar.radio("坐标系设置", ["WGS-84", "GCJ-02"], index=0, key="coord_radio")
 st.sidebar.info("✅ 卫星图底图：Esri World Imagery (WGS-84)\n若选择 GCJ-02，系统会自动转换为 WGS-84 匹配卫星图。")
 
-# ========== 航线规划页面（原样保留）==========
 if page == "航线规划":
-    # ... 航线规划页面代码与 v34 完全一致，此处省略重复内容 ...
-    pass   # 在完整代码中请保留原来的航线规划全部代码
+    st.header("🗺️ 航线规划 + 多障碍物可靠绕行 (左侧/右侧/自动/最优)")
 
-# ========== 飞行监控页面（新增控制与实时地图）==========
-elif page == "飞行监控":
-    st.header("✈️ 飞行监控 (实时地图 + 通信状态)")
+    st.sidebar.subheader("🚧 障碍物默认高度")
+    default_h = st.sidebar.number_input(
+        "新绘制障碍物的默认高度 (米)", 
+        min_value=0.0, max_value=200.0, 
+        value=st.session_state.default_obstacle_height, step=5.0,
+        key="default_height"
+    )
+    st.session_state.default_obstacle_height = default_h
+    st.sidebar.divider()
 
-    # ---------- 控制栏与状态指示灯 ----------
-    col_ctrl1, col_ctrl2, col_ctrl3, col_ctrl4, col_ctrl5, col_ctrl6 = st.columns([1, 1, 1, 1, 1, 2])
-    with col_ctrl1:
-        if st.button("▶️ 开始任务", key="btn_start", use_container_width=True):
-            st.session_state.monitor_running = True
-            st.session_state.monitor_paused = False
-            st.rerun()
-    with col_ctrl2:
-        if st.session_state.monitor_running and not st.session_state.monitor_paused:
-            if st.button("⏸️ 暂停", key="btn_pause", use_container_width=True):
-                st.session_state.monitor_paused = True
+    st.sidebar.subheader("🛡️ 安全距离 (米)")
+    safety = st.sidebar.number_input(
+        "绕行安全距离", 
+        min_value=0.0, max_value=200.0, 
+        value=st.session_state.safety_distance, step=5.0,
+        help="绕行路径与障碍物的最小距离（若找不到路径会自动增加）",
+        key="safety_dist"
+    )
+    st.session_state.safety_distance = safety
+    st.sidebar.divider()
+
+    st.sidebar.subheader("↪️ 全局绕行侧偏好（仅对下方“自动绕行”有效）")
+    side_option = st.sidebar.selectbox(
+        "偏好绕行侧",
+        options=["auto", "left", "right"],
+        index=["auto", "left", "right"].index(st.session_state.detour_side),
+        format_func=lambda x: {"auto": "自动选择最短路径", "left": "强制从左侧绕过", "right": "强制从右侧绕过"}[x],
+        key="side_select"
+    )
+    st.session_state.detour_side = side_option
+    st.sidebar.divider()
+
+    st.sidebar.subheader("📋 已添加的障碍物")
+    if not st.session_state.obstacles:
+        st.sidebar.write("暂无障碍物")
+    else:
+        for idx, obs in enumerate(st.session_state.obstacles):
+            with st.sidebar.expander(f"障碍物 {idx+1} (高度: {obs['height']} m)"):
+                new_height = st.number_input(
+                    f"高度 (m)", min_value=0.0, max_value=200.0, value=obs['height'],
+                    key=f"obs_height_{idx}", step=5.0
+                )
+                if new_height != obs['height']:
+                    obs['height'] = new_height
+                    save_obstacles_to_file(st.session_state.obstacles)
+                    st.rerun()
+                if st.button(f"🗑️ 删除障碍物 {idx+1}", key=f"del_obs_{idx}"):
+                    st.session_state.obstacles.pop(idx)
+                    save_obstacles_to_file(st.session_state.obstacles)
+                    st.session_state.detour_route = None
+                    st.rerun()
+                st.caption(f"顶点数: {len(obs['vertices'])}")
+    st.sidebar.metric("障碍物总数", len(st.session_state.obstacles))
+    st.sidebar.divider()
+    col_save1, col_save2 = st.sidebar.columns(2)
+    with col_save1:
+        if st.button("💾 保存障碍物", key="save_btn"):
+            if save_obstacles_to_file(st.session_state.obstacles):
+                st.sidebar.success("已保存")
+    with col_save2:
+        if st.button("📂 加载障碍物", key="load_btn"):
+            loaded = load_obstacles_from_file()
+            if loaded:
+                st.session_state.obstacles = loaded
+                st.sidebar.success(f"加载 {len(loaded)} 个")
                 st.rerun()
-        elif st.session_state.monitor_paused:
-            if st.button("▶️ 继续", key="btn_resume", use_container_width=True):
-                st.session_state.monitor_paused = False
-                st.rerun()
+            else:
+                st.sidebar.warning("无备份文件或文件损坏")
+    if st.sidebar.button("🧹 清空所有障碍物", key="clear_all"):
+        st.session_state.obstacles = []
+        if os.path.exists(OBSTACLE_FILE):
+            os.remove(OBSTACLE_FILE)
+        st.session_state.detour_route = None
+        st.sidebar.success("已清空")
+        st.rerun()
+    if st.sidebar.button("🔄 重置应用", key="reset_all"):
+        st.session_state.obstacles = []
+        if os.path.exists(OBSTACLE_FILE):
+            os.remove(OBSTACLE_FILE)
+        st.session_state.detour_route = None
+        st.session_state.history = []
+        st.session_state.sim = HeartbeatSimulator()
+        st.rerun()
+
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        st.subheader("📍 坐标输入")
+        lat_a = st.number_input("起点 A 纬度", value=32.2322, format="%.6f", key="lat_a")
+        lon_a = st.number_input("起点 A 经度", value=118.7490, format="%.6f", key="lon_a")
+        lat_b = st.number_input("终点 B 纬度", value=32.2343, format="%.6f", key="lat_b")
+        lon_b = st.number_input("终点 B 经度", value=118.7495, format="%.6f", key="lon_b")
+        flight_height = st.slider("设定飞行高度 (m)", 0, 100, 50, key="flight_h")
+
+        if coord_mode == "GCJ-02":
+            display_lon_a, display_lat_a = gcj02_to_wgs84(lon_a, lat_a)
+            display_lon_b, display_lat_b = gcj02_to_wgs84(lon_b, lat_b)
+            st.success("已自动将 GCJ-02 坐标转换为 WGS-84")
         else:
-            st.button("⏸️ 暂停", key="btn_pause_disabled", disabled=True, use_container_width=True)
-    with col_ctrl3:
-        if st.button("⏹️ 停止", key="btn_stop", use_container_width=True):
-            st.session_state.monitor_running = False
-            st.session_state.monitor_paused = False
+            display_lon_a, display_lat_a = lon_a, lat_a
+            display_lon_b, display_lat_b = lon_b, lat_b
+            st.info("直接使用 WGS-84 坐标")
+
+        col_btn1, col_btn2, col_btn3, col_btn4 = st.columns(4)
+        with col_btn1:
+            if st.button("✈️ 自动绕行", key="btn_auto", use_container_width=True):
+                with st.spinner("正在计算自动绕行路径..."):
+                    A_wgs = (display_lon_a, display_lat_a)
+                    B_wgs = (display_lon_b, display_lat_b)
+                    route = generate_detour_route(
+                        A_wgs, B_wgs,
+                        st.session_state.obstacles,
+                        flight_height,
+                        st.session_state.safety_distance,
+                        detour_side=st.session_state.detour_side
+                    )
+                    if len(route) == 2:
+                        st.success("✅ 无冲突，无需绕行")
+                        st.session_state.detour_route = None
+                    else:
+                        st.success(f"✅ 已生成自动绕行航线，共 {len(route)} 个航点")
+                        st.session_state.detour_route = route
+                    st.rerun()
+        with col_btn2:
+            if st.button("⬅️ 左侧绕行", key="btn_left", use_container_width=True):
+                with st.spinner("正在计算左侧绕行路径..."):
+                    A_wgs = (display_lon_a, display_lat_a)
+                    B_wgs = (display_lon_b, display_lat_b)
+                    route = generate_detour_route(
+                        A_wgs, B_wgs,
+                        st.session_state.obstacles,
+                        flight_height,
+                        st.session_state.safety_distance,
+                        detour_side="left"
+                    )
+                    if len(route) == 2:
+                        st.success("✅ 无冲突，无需绕行")
+                        st.session_state.detour_route = None
+                    else:
+                        st.success(f"✅ 已生成左侧绕行航线，共 {len(route)} 个航点")
+                        st.session_state.detour_route = route
+                    st.rerun()
+        with col_btn3:
+            if st.button("➡️ 右侧绕行", key="btn_right", use_container_width=True):
+                with st.spinner("正在计算右侧绕行路径..."):
+                    A_wgs = (display_lon_a, display_lat_a)
+                    B_wgs = (display_lon_b, display_lat_b)
+                    route = generate_detour_route(
+                        A_wgs, B_wgs,
+                        st.session_state.obstacles,
+                        flight_height,
+                        st.session_state.safety_distance,
+                        detour_side="right"
+                    )
+                    if len(route) == 2:
+                        st.success("✅ 无冲突，无需绕行")
+                        st.session_state.detour_route = None
+                    else:
+                        st.success(f"✅ 已生成右侧绕行航线，共 {len(route)} 个航点")
+                        st.session_state.detour_route = route
+                    st.rerun()
+        with col_btn4:
+            if st.button("🏆 最优路径", key="btn_optimal", use_container_width=True):
+                with st.spinner("正在计算全局最优最短路径..."):
+                    A_wgs = (display_lon_a, display_lat_a)
+                    B_wgs = (display_lon_b, display_lat_b)
+                    route = optimal_detour_route(
+                        A_wgs, B_wgs,
+                        st.session_state.obstacles,
+                        flight_height,
+                        st.session_state.safety_distance
+                    )
+                    if len(route) == 2:
+                        st.success("✅ 无冲突，无需绕行")
+                        st.session_state.detour_route = None
+                    else:
+                        st.success(f"✅ 已生成最优路径航线，共 {len(route)} 个航点")
+                        st.session_state.detour_route = route
+                    st.rerun()
+
+        if st.button("清除绕行航线", key="clear_route"):
+            st.session_state.detour_route = None
             st.rerun()
-    with col_ctrl4:
-        if st.button("🔄 重置", key="btn_reset", use_container_width=True):
-            st.session_state.monitor_running = False
-            st.session_state.monitor_paused = False
-            st.session_state.history = []
-            st.session_state.mavlink_messages = []
-            st.session_state.drone_position = (32.2322, 118.7490)
-            st.session_state.drone_track = []
+
+        if st.button("清除所有障碍物", key="clear_obs"):
+            st.session_state.obstacles = []
+            save_obstacles_to_file(st.session_state.obstacles)
+            st.session_state.detour_route = None
             st.rerun()
-    with col_ctrl5:
-        # 模拟 FCU 故障按钮
-        if st.button("⚠️ FCU 故障", key="toggle_fcu", use_container_width=True):
+
+    with col2:
+        map_center = [display_lat_a, display_lon_a]
+        m = folium.Map(
+            location=map_center, zoom_start=17,
+            tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+            attr='Esri World Imagery',
+        )
+        folium.PolyLine(
+            locations=[[display_lat_a, display_lon_a], [display_lat_b, display_lon_b]],
+            color="yellow", weight=5, opacity=0.8, popup="原始航线"
+        ).add_to(m)
+        if st.session_state.get("detour_route"):
+            detour_locs = [[lat, lng] for lng, lat in st.session_state.detour_route]
+            folium.PolyLine(
+                locations=detour_locs, color="blue", weight=4, opacity=0.9,
+                popup="绕行航线"
+            ).add_to(m)
+            start_pt = st.session_state.detour_route[0]
+            end_pt = st.session_state.detour_route[-1]
+            folium.Marker([start_pt[1], start_pt[0]], popup="绕行起点", icon=folium.Icon(color='blue', icon='play')).add_to(m)
+            folium.Marker([end_pt[1], end_pt[0]], popup="绕行终点", icon=folium.Icon(color='blue', icon='stop')).add_to(m)
+        folium.Marker([display_lat_a, display_lon_a], popup=f"起点 A (高度:{flight_height}m)", icon=folium.Icon(color='red', icon='play')).add_to(m)
+        folium.Marker([display_lat_b, display_lon_b], popup="终点 B", icon=folium.Icon(color='green', icon='stop')).add_to(m)
+        for idx, obs in enumerate(st.session_state.obstacles):
+            poly_folium = [[lat, lng] for lng, lat in obs["vertices"]]
+            folium.Polygon(
+                locations=poly_folium, color="red", weight=3, fill=True, fill_color="red", fill_opacity=0.3,
+                popup=f"障碍物 {idx+1}\n高度: {obs['height']} m"
+            ).add_to(m)
+        draw = Draw(
+            draw_options={"polyline": False, "rectangle": True, "circle": False, "marker": False, "circlemarker": False, "polygon": True},
+            edit_options={"edit": True, "remove": True}
+        )
+        draw.add_to(m)
+        output = st_folium(m, width=800, height=500, returned_objects=["last_active_drawing"])
+
+        if output and output.get("last_active_drawing"):
+            drawing = output["last_active_drawing"]
+            geom_type = drawing.get("geometry", {}).get("type")
+            coords = drawing.get("geometry", {}).get("coordinates")
+            if geom_type == "Polygon" and coords:
+                ring = coords[0]
+                poly_wgs84 = [(lng, lat) for lng, lat in ring]
+                exists = any(obs["vertices"] == poly_wgs84 for obs in st.session_state.obstacles)
+                if not exists:
+                    new_obs = {"vertices": poly_wgs84, "height": st.session_state.default_obstacle_height}
+                    st.session_state.obstacles.append(new_obs)
+                    save_obstacles_to_file(st.session_state.obstacles)
+                    st.success(f"已添加障碍物（高度 {new_obs['height']} m）")
+                    st.rerun()
+            elif geom_type == "Rectangle" and coords:
+                lng1, lat1 = coords[0]; lng2, lat2 = coords[1]
+                rect = [(lng1, lat1), (lng2, lat1), (lng2, lat2), (lng1, lat2)]
+                exists = any(obs["vertices"] == rect for obs in st.session_state.obstacles)
+                if not exists:
+                    new_obs = {"vertices": rect, "height": st.session_state.default_obstacle_height}
+                    st.session_state.obstacles.append(new_obs)
+                    save_obstacles_to_file(st.session_state.obstacles)
+                    st.success("已添加矩形障碍物")
+                    st.rerun()
+
+# ========== 飞行监控（拓扑图 + MAVLink 报文）==========
+elif page == "飞行监控":
+    st.header("✈️ 飞行监控 (心跳包实时状态)")
+
+    col_ctrl1, col_ctrl2, col_ctrl3 = st.columns([1, 1, 2])
+    with col_ctrl1:
+        start_btn = st.button("▶️ 开始接收实时数据", key="monitor_start")
+    with col_ctrl2:
+        if st.button("⚠️ 模拟 FCU 故障", key="toggle_fcu"):
             st.session_state.fcu_online = not st.session_state.fcu_online
             st.rerun()
-    with col_ctrl6:
-        # 状态指示灯
-        if st.session_state.monitor_running:
-            if st.session_state.monitor_paused:
-                status_color = "#FFA500"   # 橙色
-                status_text = "已暂停"
-            else:
-                status_color = "#00FF00"   # 绿色
-                status_text = "飞行中"
-        else:
-            status_color = "#808080"       # 灰色
-            status_text = "已停止"
-        st.markdown(
-            f"<div style='display:flex; align-items:center;'>"
-            f"<span style='background-color:{status_color}; width:16px; height:16px; border-radius:50%; display:inline-block; margin-right:8px;'></span>"
-            f"<span style='font-weight:bold;'>{status_text}</span>"
-            f"</div>",
-            unsafe_allow_html=True
-        )
+    with col_ctrl3:
+        st.caption("FCU 当前状态: " + ("🟢 在线" if st.session_state.fcu_online else "🔴 故障"))
 
-    # ---------- 实时地图（最上方）----------
-    st.subheader("📍 无人机实时位置")
-    # 每次重新渲染地图（即使暂停也保持显示）
-    drone_map = folium.Map(
-        location=[st.session_state.drone_position[0], st.session_state.drone_position[1]],
-        zoom_start=17,
-        tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-        attr='Esri World Imagery',
-    )
-    # 绘制轨迹
-    if len(st.session_state.drone_track) >= 2:
-        track_locs = [[lat, lon] for lat, lon in st.session_state.drone_track]
-        folium.PolyLine(
-            locations=track_locs,
-            color="yellow", weight=3, opacity=0.8,
-            popup="飞行轨迹"
-        ).add_to(drone_map)
-    # 当前位置标记
-    folium.Marker(
-        [st.session_state.drone_position[0], st.session_state.drone_position[1]],
-        popup="无人机",
-        icon=folium.Icon(color='red', icon='plane', prefix='fa')
-    ).add_to(drone_map)
-    # 动态 key 强制刷新
-    st_folium(drone_map, width=800, height=400, key="drone_realtime_map")
+    if start_btn:
+        st.session_state.monitor_active = True
 
-    # ---------- 数据更新（仅当运行且未暂停时）----------
-    if st.session_state.monitor_running and not st.session_state.monitor_paused:
-        # 生成新数据
-        packet = st.session_state.sim.generate_packet()
-        st.session_state.history.append(packet)
-        # 生成 MAVLink 报文
+    if not st.session_state.get("monitor_active", False):
+        st.info("请点击「开始接收实时数据」按钮开始模拟监控。")
+        # 离线拓扑图
+        dot = graphviz.Digraph()
+        dot.attr(rankdir='LR')
+        dot.node('GCS', 'GCS\n(地面站)', shape='box', style='filled', fillcolor='lightgrey')
+        dot.node('OBC', 'OBC\n(机载计算机)', shape='box', style='filled', fillcolor='lightgrey')
+        dot.node('FCU', 'FCU\n(飞控)', shape='box', style='filled', fillcolor='lightgrey')
+        dot.edge('GCS', 'OBC', label='未连接', color='grey', style='dashed')
+        dot.edge('OBC', 'FCU', label='未连接', color='grey', style='dashed')
+        st.graphviz_chart(dot)
+    else:
+        placeholder = st.empty()
+        # 初始化 MAVLink 报文序列号
         mav_seq = len(st.session_state.mavlink_messages)
-        mav_msg = generate_mavlink_message(mav_seq)
-        st.session_state.mavlink_messages.append(mav_msg)
-        if len(st.session_state.mavlink_messages) > 100:
-            st.session_state.mavlink_messages = st.session_state.mavlink_messages[-100:]
+        for _ in range(50):
+            packet = st.session_state.sim.generate_packet()
+            st.session_state.history.append(packet)
+            plot_df = pd.DataFrame(st.session_state.history[-20:])
 
-        # 更新无人机位置
-        if mav_msg["msg_name"] == "GLOBAL_POSITION_INT":
-            lat = mav_msg["fields"]["lat"] / 1e7
-            lon = mav_msg["fields"]["lon"] / 1e7
-            st.session_state.drone_position = (lat, lon)
-            st.session_state.drone_track.append((lat, lon))
-            if len(st.session_state.drone_track) > 20:
-                st.session_state.drone_track = st.session_state.drone_track[-20:]
+            # 生成一条 MAVLink 模拟报文
+            mav_msg = generate_mavlink_message(mav_seq)
+            st.session_state.mavlink_messages.append(mav_msg)
+            mav_seq += 1
+            # 限制保留最近 100 条
+            if len(st.session_state.mavlink_messages) > 100:
+                st.session_state.mavlink_messages = st.session_state.mavlink_messages[-100:]
 
-    # ---------- 显示其他监控组件（无论是否暂停都显示最新数据）----------
-    if st.session_state.history:   # 有数据才显示
-        plot_df = pd.DataFrame(st.session_state.history[-20:])
-        m1, m2, m3 = st.columns(3)
-        avg_rtt, loss_rate = st.session_state.sim.get_summary(st.session_state.history)
-        latest = st.session_state.history[-1]
-        m1.metric("实时 RTT", f"{latest['rtt']:.3f}s",
-                  delta=latest['status'], delta_color="inverse")
-        m2.metric("平均 RTT", f"{avg_rtt:.3f}s")
-        m3.metric("累计丢包率", f"{loss_rate:.1f}%")
+            with placeholder.container():
+                # 指标卡片
+                m1, m2, m3 = st.columns(3)
+                avg_rtt, loss_rate = st.session_state.sim.get_summary(st.session_state.history)
+                m1.metric("实时 RTT", f"{packet['rtt']:.3f}s",
+                          delta=packet['status'], delta_color="inverse")
+                m2.metric("平均 RTT", f"{avg_rtt:.3f}s")
+                m3.metric("累计丢包率", f"{loss_rate:.1f}%")
 
-        st.subheader("通讯延迟 (RTT) 变化曲线")
-        st.line_chart(plot_df.set_index("time")["rtt"])
+                st.subheader("通讯延迟 (RTT) 变化曲线")
+                st.line_chart(plot_df.set_index("time")["rtt"])
 
-        if latest['is_timeout']:
-            st.error(f"警报：北京时间 {latest['time']} 发生通讯超时！")
-    else:
-        st.info("暂无监控数据，请点击「开始任务」")
+                if packet['is_timeout']:
+                    st.error(f"警报：北京时间 {packet['time']} 发生通讯超时！")
 
-    # 拓扑图（始终显示）
-    st.subheader("📡 GCS-OBC-FCU 通信拓扑")
-    dot = graphviz.Digraph()
-    dot.attr(rankdir='LR', size='6,2')
-    gcs_color = 'lightblue'
-    obc_color = 'lightblue'
-    fcu_color = 'lightgreen' if st.session_state.fcu_online else 'lightcoral'
-    dot.node('GCS', 'GCS\n(地面站)', shape='box', style='filled', fillcolor=gcs_color)
-    dot.node('OBC', 'OBC\n(机载计算机)', shape='box', style='filled', fillcolor=obc_color)
-    dot.node('FCU', 'FCU\n(飞控)', shape='box', style='filled', fillcolor=fcu_color)
+                # 拓扑图
+                st.subheader("📡 GCS-OBC-FCU 通信拓扑")
+                dot = graphviz.Digraph()
+                dot.attr(rankdir='LR', size='6,2')
+                gcs_color = 'lightblue'
+                obc_color = 'lightblue'
+                fcu_color = 'lightgreen' if st.session_state.fcu_online else 'lightcoral'
+                dot.node('GCS', 'GCS\n(地面站)', shape='box', style='filled', fillcolor=gcs_color)
+                dot.node('OBC', 'OBC\n(机载计算机)', shape='box', style='filled', fillcolor=obc_color)
+                dot.node('FCU', 'FCU\n(飞控)', shape='box', style='filled', fillcolor=fcu_color)
+                if packet['is_timeout']:
+                    dot.edge('GCS', 'OBC', label='超时', color='red', style='dashed', fontcolor='red')
+                else:
+                    label = f"{packet['rtt']:.3f} s"
+                    dot.edge('GCS', 'OBC', label=label, color='green', fontcolor='green')
+                if st.session_state.fcu_online:
+                    dot.edge('OBC', 'FCU', label='0.005 s', color='green', fontcolor='green')
+                else:
+                    dot.edge('OBC', 'FCU', label='中断', color='red', style='dashed', fontcolor='red')
+                st.graphviz_chart(dot, use_container_width=True)
 
-    if st.session_state.history and not st.session_state.history[-1]['is_timeout']:
-        rtt_label = f"{st.session_state.history[-1]['rtt']:.3f} s"
-        dot.edge('GCS', 'OBC', label=rtt_label, color='green', fontcolor='green')
-    else:
-        dot.edge('GCS', 'OBC', label='超时', color='red', style='dashed', fontcolor='red')
-    if st.session_state.fcu_online:
-        dot.edge('OBC', 'FCU', label='0.005 s', color='green', fontcolor='green')
-    else:
-        dot.edge('OBC', 'FCU', label='中断', color='red', style='dashed', fontcolor='red')
-    st.graphviz_chart(dot, use_container_width=True)
+                # ---------- 新增：MAVLink 报文流展示 ----------
+                with st.expander("📨 MAVLink 报文流（最近 50 条）", expanded=True):
+                    if st.session_state.mavlink_messages:
+                        # 将报文列表转为 DataFrame 以便表格显示
+                        df_msgs = pd.DataFrame(st.session_state.mavlink_messages[-50:])
+                        # 格式化 fields 列为可读字符串
+                        df_msgs["fields_str"] = df_msgs["fields"].apply(
+                            lambda f: ", ".join(f"{k}={v}" for k, v in f.items())
+                        )
+                        display_df = df_msgs[["seq", "time", "msg_name", "fields_str"]]
+                        display_df.columns = ["序号", "时间", "消息类型", "关键字段"]
+                        st.dataframe(display_df, use_container_width=True, height=300)
+                    else:
+                        st.info("暂无报文数据")
 
-    # MAVLink 报文流
-    with st.expander("📨 MAVLink 报文流（最近 50 条）", expanded=True):
-        if st.session_state.mavlink_messages:
-            df_msgs = pd.DataFrame(st.session_state.mavlink_messages[-50:])
-            df_msgs["fields_str"] = df_msgs["fields"].apply(
-                lambda f: ", ".join(f"{k}={v}" for k, v in f.items())
-            )
-            display_df = df_msgs[["seq", "time", "msg_name", "fields_str"]]
-            display_df.columns = ["序号", "时间", "消息类型", "关键字段"]
-            st.dataframe(display_df, use_container_width=True, height=300)
-        else:
-            st.info("暂无报文数据")
+            time.sleep(0.4)
 
-    # ---------- 循环驱动 ----------
-    if st.session_state.monitor_running:
-        time.sleep(0.4)
+        # 循环结束后重置
+        st.session_state.monitor_active = False
         st.rerun()
