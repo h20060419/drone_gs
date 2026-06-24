@@ -12,6 +12,25 @@ import graphviz
 import random
 import datetime
 
+# ========== Haversine 距离 ==========
+def haversine_distance(lat1, lon1, lat2, lon2):
+    R = 6371000  # 地球半径，米
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlam = math.radians(lon2 - lon1)
+    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlam/2)**2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+
+def calculate_route_total_distance(route):
+    """route: [(lng, lat), ...] 返回总距离(米)"""
+    total = 0.0
+    for i in range(len(route)-1):
+        lng1, lat1 = route[i]
+        lng2, lat2 = route[i+1]
+        total += haversine_distance(lat1, lng1, lat2, lng2)
+    return total
+
 # ========== MAVLink 模拟报文生成 ==========
 MAVLINK_MSG_TYPES = [
     {"name": "HEARTBEAT", "fields": {"type": "MAV_TYPE_QUADROTOR", "autopilot": "PX4", "base_mode": 81}},
@@ -21,26 +40,26 @@ MAVLINK_MSG_TYPES = [
     {"name": "RC_CHANNELS", "fields": {"chan1_raw": 1500, "chan2_raw": 1500, "chan3_raw": 1200, "chan4_raw": 1500}},
 ]
 
-def generate_mavlink_message(seq):
-    """生成一条模拟 MAVLink 报文（字典格式）"""
+def generate_mavlink_message(seq, current_lat=None, current_lon=None, battery=None):
+    """生成 MAVLink 报文，可注入实际飞行数据"""
     msg_type = random.choice(MAVLINK_MSG_TYPES)
     now = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    # 随机微调数值以产生变化感
-    if msg_type["name"] == "GLOBAL_POSITION_INT":
-        lat = 324000000 + random.randint(-1000, 1000)
-        lon = 1187000000 + random.randint(-1000, 1000)
-        alt = 50000 + random.randint(-500, 500)
+
+    if msg_type["name"] == "GLOBAL_POSITION_INT" and current_lat is not None:
+        lat = int(current_lat * 1e7)
+        lon = int(current_lon * 1e7)
+        alt = 50000
         fields = {"lat": lat, "lon": lon, "alt": alt, "relative_alt": alt}
+    elif msg_type["name"] == "SYS_STATUS" and battery is not None:
+        fields = {"voltage_battery": 11200, "current_battery": -5,
+                  "battery_remaining": int(battery)}
     elif msg_type["name"] == "ATTITUDE":
         fields = {"roll": round(random.uniform(-0.1, 0.1), 3),
                   "pitch": round(random.uniform(-0.1, 0.1), 3),
                   "yaw": round(random.uniform(0, 6.28), 3)}
-    elif msg_type["name"] == "SYS_STATUS":
-        fields = {"voltage_battery": 11200 + random.randint(-100, 100),
-                  "current_battery": -5 + random.randint(-2, 2),
-                  "battery_remaining": 85 + random.randint(-1, 1)}
     else:
         fields = msg_type["fields"]
+
     return {
         "seq": seq,
         "time": now,
@@ -264,7 +283,7 @@ def generate_detour_route(A, B, obstacles, flight_height, safety_meters, detour_
     st.warning("⚠️ 无法找到完全避障路径，请增加安全距离或调整障碍物位置")
     return [A, B]
 
-# ========== 新增：基于Dijkstra的最优路径（全局最短）==========
+# ========== Dijkstra 最优路径 ==========
 def optimal_detour_route(A, B, obstacles, flight_height, safety_meters, max_attempts=3):
     relevant = [obs for obs in obstacles if flight_height < obs["height"]]
     if not relevant:
@@ -355,18 +374,19 @@ if "app_version" not in st.session_state:
     st.session_state.detour_route = None
     st.session_state.detour_side = "auto"
     st.session_state.fcu_online = True
-    st.session_state.monitor_active = False
-    st.session_state.mavlink_messages = []      
-    st.session_state.app_version = "v34_mavlink"
-    
-    # 新增：监控模拟数据状态
-    st.session_state.mission_progress = 0.0
-    st.session_state.current_waypoint = 0
-    st.session_state.total_waypoints = 10
-    st.session_state.flight_speed = 8.5
-    st.session_state.elapsed_time = 0
-    st.session_state.remaining_dist = 500.0
-    st.session_state.battery_level = 96.0
+    st.session_state.mavlink_messages = []
+    # 飞行任务状态
+    st.session_state.task_route = None          # 航线点列表 [(lng,lat),...]
+    st.session_state.task_running = False
+    st.session_state.task_paused = False
+    st.session_state.current_position = (32.2322, 118.7490)  # (lat, lon)
+    st.session_state.total_distance = 0.0
+    st.session_state.traveled_distance = 0.0
+    st.session_state.start_time = None
+    st.session_state.speed = 5.0               # m/s
+    st.session_state.battery = 100.0
+    st.session_state.flight_history = []        # 已飞轨迹点 [(lat,lon),...]
+    st.session_state.app_version = "v38_final"
 else:
     if st.session_state.obstacles and isinstance(st.session_state.obstacles[0], list):
         new_obs = []
@@ -374,9 +394,6 @@ else:
             new_obs.append({"vertices": poly, "height": 30.0})
         st.session_state.obstacles = new_obs
         save_obstacles_to_file(st.session_state.obstacles)
-    # 重置路由
-    if st.session_state.detour_route:
-        st.session_state.total_waypoints = len(st.session_state.detour_route)
 
 st.sidebar.title("🧭 导航控制")
 page = st.sidebar.radio("请选择功能页面", ["航线规划", "飞行监控"], key="page_radio")
@@ -637,225 +654,229 @@ if page == "航线规划":
                     st.success("已添加矩形障碍物")
                     st.rerun()
 
-# ========== 飞行监控（修改为截图UI布局）==========
+# ==================== 飞行监控页面（增强版） ====================
 elif page == "飞行监控":
-    # 注入简单的 CSS 样式，模拟真实截图
-    st.markdown("""
-    <style>
-    .status-badge {
-        display: flex; align-items: center; gap: 8px;
-        padding: 4px 12px; border-radius: 12px; border: 1px solid #f0f0f0;
-        background: #fafafa; height: 38px; width: fit-content;
-    }
-    .status-dot { width: 10px; height: 10px; border-radius: 50%; background-color: #fbbf24; display: inline-block; }
-    .metric-label { font-size: 0.85rem; color: #64748b; margin-bottom: 2px; font-weight: 500;}
-    .metric-value { font-size: 1.8rem; font-weight: 600; line-height: 1.2; }
-    .metric-unit { font-size: 0.9rem; color: #64748b; font-weight: normal; margin-left: 5px; }
-    </style>
-    """, unsafe_allow_html=True)
+    st.header("✈️ 飞行任务监控 (实时地图 + 航线跟踪)")
 
-    st.title("✈️ 飞行实时画面 - 任务执行监控")
+    # 侧边栏任务设置
+    with st.sidebar:
+        st.subheader("⚙️ 飞行参数")
+        new_speed = st.slider("飞行速度 (m/s)", 1.0, 15.0, st.session_state.speed, 0.5)
+        if new_speed != st.session_state.speed:
+            st.session_state.speed = new_speed
+        st.divider()
+        if st.button("📥 加载规划航线"):
+            if st.session_state.detour_route is not None:
+                st.session_state.task_route = st.session_state.detour_route.copy()
+                st.session_state.current_position = (st.session_state.task_route[0][1], st.session_state.task_route[0][0])
+                st.session_state.total_distance = calculate_route_total_distance(st.session_state.task_route)
+                st.session_state.traveled_distance = 0.0
+                st.session_state.flight_history = [st.session_state.current_position]
+                st.session_state.battery = 100.0
+                st.session_state.start_time = None
+                st.session_state.task_running = False
+                st.session_state.task_paused = False
+                st.success(f"航线已加载 ({len(st.session_state.task_route)} 个航点，总长 {st.session_state.total_distance:.1f} m)")
+                st.rerun()
+            else:
+                st.warning("请先在航线规划页面生成绕行航线")
 
-    # ------- 1. 顶部按钮与状态栏 -------
-    col_btn1, col_btn2, col_btn3, col_btn4, col_status = st.columns([1.5, 1, 1, 1, 1.5])
-    with col_btn1:
-        start_btn = st.button("▶️ 开始任务", type="primary", use_container_width=True)
-    with col_btn2:
-        st.button("⏸️ 暂停", use_container_width=True)
-    with col_btn3:
-        st.button("⏹️ 停止", use_container_width=True)
-    with col_btn4:
-        st.button("🔄 重置", use_container_width=True)
-    with col_status:
-        st.markdown("""
-        <div class="status-badge">
-            <span class="status-dot"></span>
-            <span style="font-weight:500; color:#334155;">已暂停</span>
-        </div>
-        """, unsafe_allow_html=True)
-
-    # ------- 2. 动态指标面板（使用 empty 占位）-------
-    m1, m2, m3, m4, m5, m6 = st.columns(6)
-    
-    # 创建占位符
-    wp_placeholder = m1.empty()
-    sp_placeholder = m2.empty()
-    tm_placeholder = m3.empty()
-    ds_placeholder = m4.empty()
-    et_placeholder = m5.empty()
-    bt_placeholder = m6.empty()
-    
-    # 初始显示
-    wp_placeholder.markdown(f'<div class="metric-label">📍 当前航点</div><div class="metric-value">{st.session_state.current_waypoint}/{st.session_state.total_waypoints}</div>', unsafe_allow_html=True)
-    sp_placeholder.markdown(f'<div class="metric-label">🚀 飞行速度</div><div class="metric-value">{st.session_state.flight_speed:.1f}<span class="metric-unit">m/s</span></div>', unsafe_allow_html=True)
-    tm_placeholder.markdown(f'<div class="metric-label">⏱️ 已用时间</div><div class="metric-value">00:00</div>', unsafe_allow_html=True)
-    ds_placeholder.markdown(f'<div class="metric-label">📏 剩余距离</div><div class="metric-value">{int(st.session_state.remaining_dist)}<span class="metric-unit">m</span></div>', unsafe_allow_html=True)
-    et_placeholder.markdown(f'<div class="metric-label">⏳ 预计到达</div><div class="metric-value">00:00</div>', unsafe_allow_html=True)
-    bt_placeholder.markdown(f'<div class="metric-label">🔋 电量模拟</div><div class="metric-value">{st.session_state.battery_level:.1f}<span class="metric-unit">%</span></div>', unsafe_allow_html=True)
-    
-    # ------- 3. 任务进度条（使用 empty 占位）-------
-    st.markdown('<div style="font-size:0.8rem;color:#64748b;margin-bottom:4px;">任务进度: <span id="progress_text">0</span>%</div>', unsafe_allow_html=True)
-    progress_bar = st.progress(0.0)
-
-    # ------- 4. 双栏布局：实时地图与拓扑图 -------
-    col_map, col_top = st.columns([1.5, 1])
-    with col_map:
-        st.subheader("🗺️ 实时飞行地图")
-        map_placeholder = st.empty() # 地图整体占位
-
-    with col_top:
-        st.subheader("📶 通信链路拓扑与数据流")
-        st.markdown("🟢 GCS 在线 &nbsp;&nbsp; 🟢 OBC 在线 &nbsp;&nbsp; 🟢 FCU 在线")
-        # 拓扑图部分渲染（兼容你的原始代码逻辑）
-        dot = graphviz.Digraph()
-        dot.attr(rankdir='LR', size='6,2')
-        gcs_color = 'lightblue'
-        obc_color = 'lightblue'
-        fcu_color = 'lightgreen' if st.session_state.fcu_online else 'lightcoral'
-        dot.node('GCS', 'GCS\n(地面站)', shape='box', style='filled', fillcolor=gcs_color)
-        dot.node('OBC', 'OBC\n(机载计算机)', shape='box', style='filled', fillcolor=obc_color)
-        dot.node('FCU', 'FCU\n(飞控)', shape='box', style='filled', fillcolor=fcu_color)
-        dot.edge('GCS', 'OBC', label='UDP:14550', color='#999', fontcolor='#555')
-        if st.session_state.fcu_online:
-            dot.edge('OBC', 'FCU', label='MAVLink', color='#999', fontcolor='#555')
+    # 控制栏
+    col_ctrl1, col_ctrl2, col_ctrl3, col_ctrl4, col_ctrl5, col_ctrl6 = st.columns([1, 1, 1, 1, 1, 2])
+    with col_ctrl1:
+        if st.button("▶️ 开始任务", key="btn_start", disabled=(st.session_state.task_route is None)):
+            if st.session_state.task_route is not None:
+                st.session_state.task_running = True
+                st.session_state.task_paused = False
+                if st.session_state.start_time is None:
+                    st.session_state.start_time = time.time()
+                st.rerun()
+    with col_ctrl2:
+        if st.session_state.task_running and not st.session_state.task_paused:
+            if st.button("⏸️ 暂停", key="btn_pause"):
+                st.session_state.task_paused = True
+                st.rerun()
+        elif st.session_state.task_paused:
+            if st.button("▶️ 继续", key="btn_resume"):
+                st.session_state.task_paused = False
+                st.rerun()
         else:
-            dot.edge('OBC', 'FCU', label='中断', color='red', style='dashed', fontcolor='red')
-        st.graphviz_chart(dot, use_container_width=True)
-        st.caption("📊 **链路统计:** GCS↔OBC 正常  OBC↔FCU 正常  延迟 ~25ms  丢包率: 0.1%")
+            st.button("⏸️ 暂停", key="btn_pause_disabled", disabled=True)
+    with col_ctrl3:
+        if st.button("⏹️ 停止", key="btn_stop"):
+            st.session_state.task_running = False
+            st.session_state.task_paused = False
+            st.rerun()
+    with col_ctrl4:
+        if st.button("🔄 重置", key="btn_reset"):
+            st.session_state.task_running = False
+            st.session_state.task_paused = False
+            if st.session_state.task_route is not None:
+                st.session_state.current_position = (st.session_state.task_route[0][1], st.session_state.task_route[0][0])
+                st.session_state.traveled_distance = 0.0
+                st.session_state.flight_history = [st.session_state.current_position]
+                st.session_state.battery = 100.0
+                st.session_state.start_time = None
+            st.rerun()
+    with col_ctrl5:
+        if st.button("⚠️ FCU 故障", key="toggle_fcu"):
+            st.session_state.fcu_online = not st.session_state.fcu_online
+            st.rerun()
+    with col_ctrl6:
+        if st.session_state.task_running:
+            if st.session_state.task_paused:
+                color, text = "#FFA500", "已暂停"
+            else:
+                color, text = "#00FF00", "飞行中"
+        else:
+            color, text = "#808080", "已停止"
+        st.markdown(
+            f"<div style='display:flex; align-items:center;'>"
+            f"<span style='background-color:{color}; width:16px; height:16px; border-radius:50%; display:inline-block; margin-right:8px;'></span>"
+            f"<span style='font-weight:bold;'>{text}</span></div>",
+            unsafe_allow_html=True
+        )
 
-    # ------- 5. 生成模拟飞行地图的初始布局 -------
-    # 检查是否有在航线规划页面生成的避障航线
-    route_path = st.session_state.detour_route
-    if not route_path:
-        route_path = [(118.7490, 32.2322), (118.7495, 32.2343)] # 默认一条直线
-    
-    # 创建 Folium 地图对象
-    m = folium.Map(location=[route_path[0][1], route_path[0][0]], zoom_start=17,
+    # ====== 任务推进逻辑 ======
+    if st.session_state.task_running and not st.session_state.task_paused and st.session_state.task_route is not None:
+        step_dist = st.session_state.speed * 0.5  # 0.5秒一个周期
+        new_traveled = st.session_state.traveled_distance + step_dist
+        if new_traveled >= st.session_state.total_distance:
+            new_traveled = st.session_state.total_distance
+            st.session_state.task_running = False
+            st.session_state.task_paused = False
+        st.session_state.traveled_distance = new_traveled
+
+        # 根据 traveled_distance 计算当前位置
+        route = st.session_state.task_route
+        cum = 0.0
+        pos = None
+        for i in range(len(route)-1):
+            lng1, lat1 = route[i]
+            lng2, lat2 = route[i+1]
+            seg_len = haversine_distance(lat1, lng1, lat2, lng2)
+            if cum + seg_len >= new_traveled:
+                ratio = (new_traveled - cum) / seg_len if seg_len > 0 else 0
+                interp_lng = lng1 + (lng2 - lng1) * ratio
+                interp_lat = lat1 + (lat2 - lat1) * ratio
+                pos = (interp_lat, interp_lng)
+                break
+            cum += seg_len
+        if pos is None:
+            pos = (route[-1][1], route[-1][0])
+        st.session_state.current_position = pos
+        st.session_state.flight_history.append(pos)
+        if len(st.session_state.flight_history) > 100:
+            st.session_state.flight_history = st.session_state.flight_history[-100:]
+
+        # 电量消耗 (满电飞10km)
+        battery_used = (step_dist / 10000) * 100
+        st.session_state.battery = max(0, st.session_state.battery - battery_used)
+
+        # 生成 MAVLink 报文（注入位置和电量）
+        mav_seq = len(st.session_state.mavlink_messages)
+        mav_msg = generate_mavlink_message(mav_seq, pos[0], pos[1], st.session_state.battery)
+        st.session_state.mavlink_messages.append(mav_msg)
+        if len(st.session_state.mavlink_messages) > 100:
+            st.session_state.mavlink_messages = st.session_state.mavlink_messages[-100:]
+
+        # 心跳包模拟
+        packet = st.session_state.sim.generate_packet()
+        st.session_state.history.append(packet)
+
+    # ====== 实时地图 ======
+    st.subheader("📍 实时飞行地图")
+    if st.session_state.task_route is not None:
+        route_latlng = [(lat, lng) for lng, lat in st.session_state.task_route]
+        map_center = [st.session_state.current_position[0], st.session_state.current_position[1]]
+    else:
+        route_latlng = []
+        map_center = [32.2322, 118.7490]
+
+    m = folium.Map(location=map_center, zoom_start=17,
                    tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
                    attr='Esri World Imagery')
-    
-    # 绘制绕行航线（绿色轨迹）
-    folium.PolyLine(
-        locations=[[pt[1], pt[0]] for pt in route_path],
-        color="#00ff00", weight=4, opacity=0.9
+    if route_latlng:
+        folium.PolyLine(route_latlng, color='blue', weight=4, opacity=0.7, popup="规划航线").add_to(m)
+    if len(st.session_state.flight_history) >= 2:
+        folium.PolyLine(st.session_state.flight_history, color='yellow', weight=4, opacity=0.9, popup="已飞轨迹").add_to(m)
+    folium.Marker(
+        [st.session_state.current_position[0], st.session_state.current_position[1]],
+        popup="无人机",
+        icon=folium.Icon(color='red', icon='plane', prefix='fa')
     ).add_to(m)
+    st_folium(m, width=800, height=450, key="mission_map")
 
-    # 绘制所有红色航点（起点、终点、中间点）
-    for i, (lon, lat) in enumerate(route_path):
-        if i == 0:
-            folium.Marker([lat, lon], popup="起点", icon=folium.Icon(color='red', icon='play', prefix='fa')).add_to(m)
-        elif i == len(route_path) - 1:
-            folium.Marker([lat, lon], popup="终点", icon=folium.Icon(color='darkred', icon='times', prefix='fa')).add_to(m)
+    # ====== 任务指标 ======
+    if st.session_state.task_route is not None:
+        total_dist = st.session_state.total_distance
+        traveled = st.session_state.traveled_distance
+        remaining = max(0, total_dist - traveled)
+        elapsed = time.time() - st.session_state.start_time if st.session_state.start_time else 0
+        if st.session_state.task_running:
+            elapsed_str = f"{int(elapsed//60)}分{int(elapsed%60)}秒"
         else:
-            folium.Marker([lat, lon], popup=f"航点 {i}", icon=folium.Icon(color='red', icon='info-sign', prefix='fa')).add_to(m)
+            elapsed_str = f"{int(elapsed//60)}分{int(elapsed%60)}秒" if st.session_state.start_time else "0分0秒"
 
-    # 在地图上绘制障碍物
-    for obs in st.session_state.obstacles:
-        poly_folium = [[lat, lng] for lng, lat in obs["vertices"]]
-        folium.Polygon(locations=poly_folium, color="red", weight=3, fill=True, fill_color="red", fill_opacity=0.2).add_to(m)
+        col1, col2, col3, col4, col5 = st.columns(5)
+        col1.metric("总航点数", len(st.session_state.task_route))
+        col2.metric("飞行速度", f"{st.session_state.speed:.1f} m/s")
+        col3.metric("已用时间", elapsed_str)
+        col4.metric("剩余距离", f"{remaining:.1f} m")
+        col5.metric("电池电量", f"{st.session_state.battery:.1f}%")
 
-    # 渲染初始地图
-    with map_placeholder.container():
-        st_folium(m, width=700, height=450, returned_objects=[])
-
-    # ------- 6. 核心飞行循环（保留你的 for 循环与 time.sleep 结构） -------
-    if start_btn:
-        st.session_state.monitor_active = True
-
-    if not st.session_state.get("monitor_active", False):
-        st.info("请点击「开始任务」进行飞行仿真。")
+        progress = min(traveled / total_dist, 1.0) if total_dist > 0 else 0
+        st.progress(progress, text=f"任务进度：{progress*100:.1f}%")
     else:
-        placeholder = st.empty()
-        # 初始化 MAVLink 报文序列号
-        mav_seq = len(st.session_state.mavlink_messages)
-        
-        # 你的原始 50 次循环
-        for i in range(50):
-            # 1. 生成模拟心跳数据
-            packet = st.session_state.sim.generate_packet()
-            st.session_state.history.append(packet)
-            plot_df = pd.DataFrame(st.session_state.history[-20:])
+        st.info("尚未加载飞行航线，请在侧边栏点击「加载规划航线」或前往航线规划页面生成绕行航线")
 
-            # 2. 生成 MAVLink 报文
-            mav_msg = generate_mavlink_message(mav_seq)
-            st.session_state.mavlink_messages.append(mav_msg)
-            mav_seq += 1
-            if len(st.session_state.mavlink_messages) > 100:
-                st.session_state.mavlink_messages = st.session_state.mavlink_messages[-100:]
+    # ====== RTT 曲线 ======
+    if st.session_state.history:
+        plot_df = pd.DataFrame(st.session_state.history[-20:])
+        m1, m2, m3 = st.columns(3)
+        avg_rtt, loss_rate = st.session_state.sim.get_summary(st.session_state.history)
+        latest = st.session_state.history[-1]
+        m1.metric("实时 RTT", f"{latest['rtt']:.3f}s", delta=latest['status'], delta_color="inverse")
+        m2.metric("平均 RTT", f"{avg_rtt:.3f}s")
+        m3.metric("累计丢包率", f"{loss_rate:.1f}%")
+        st.subheader("通讯延迟 (RTT) 变化曲线")
+        st.line_chart(plot_df.set_index("time")["rtt"])
 
-            # 3. 模拟飞行数据的逐步递进
-            progress_val = (i + 1) / 50 * 100
-            total_wp = len(route_path)
-            current_wp_idx = int((progress_val / 100) * (total_wp - 1))
-            speed_val = 8.5 + random.uniform(-0.5, 0.5)
-            elapsed_sec = i * 0.5
-            remain_dist = max(0, 500 - (progress_val / 100) * 500)
-            battery_val = max(0, 96 - (progress_val / 100) * 4)
-            
-            # 4. 刷新顶部指标数据（通过 empty 占位符注入 HTML）
-            wp_placeholder.markdown(f'<div class="metric-label">📍 当前航点</div><div class="metric-value">{min(current_wp_idx+1, total_wp)}/{total_wp}</div>', unsafe_allow_html=True)
-            sp_placeholder.markdown(f'<div class="metric-label">🚀 飞行速度</div><div class="metric-value">{speed_val:.1f}<span class="metric-unit">m/s</span></div>', unsafe_allow_html=True)
-            tm_placeholder.markdown(f'<div class="metric-label">⏱️ 已用时间</div><div class="metric-value">{int(elapsed_sec//60):02d}:{int(elapsed_sec%60):02d}</div>', unsafe_allow_html=True)
-            ds_placeholder.markdown(f'<div class="metric-label">📏 剩余距离</div><div class="metric-value">{int(remain_dist)}<span class="metric-unit">m</span></div>', unsafe_allow_html=True)
-            et_placeholder.markdown(f'<div class="metric-label">⏳ 预计到达</div><div class="metric-value">00:00</div>', unsafe_allow_html=True)
-            bt_placeholder.markdown(f'<div class="metric-label">🔋 电量模拟</div><div class="metric-value">{battery_val:.1f}<span class="metric-unit">%</span></div>', unsafe_allow_html=True)
-            
-            # 5. 刷新进度条
-            progress_bar.progress(progress_val / 100.0)
-            st.markdown(f'<div style="font-size:0.8rem;color:#64748b;margin-bottom:4px;margin-top:-8px;">任务进度: {int(progress_val)}%</div>', unsafe_allow_html=True)
+    # ====== 拓扑图 ======
+    st.subheader("📡 GCS-OBC-FCU 通信拓扑")
+    dot = graphviz.Digraph()
+    dot.attr(rankdir='LR', size='6,2')
+    gcs_color = 'lightblue'
+    obc_color = 'lightblue'
+    fcu_color = 'lightgreen' if st.session_state.fcu_online else 'lightcoral'
+    dot.node('GCS', 'GCS\n(地面站)', shape='box', style='filled', fillcolor=gcs_color)
+    dot.node('OBC', 'OBC\n(机载计算机)', shape='box', style='filled', fillcolor=obc_color)
+    dot.node('FCU', 'FCU\n(飞控)', shape='box', style='filled', fillcolor=fcu_color)
+    if st.session_state.history and not st.session_state.history[-1]['is_timeout']:
+        rtt_label = f"{st.session_state.history[-1]['rtt']:.3f} s"
+        dot.edge('GCS', 'OBC', label=rtt_label, color='green', fontcolor='green')
+    else:
+        dot.edge('GCS', 'OBC', label='超时', color='red', style='dashed', fontcolor='red')
+    if st.session_state.fcu_online:
+        dot.edge('OBC', 'FCU', label='0.005 s', color='green', fontcolor='green')
+    else:
+        dot.edge('OBC', 'FCU', label='中断', color='red', style='dashed', fontcolor='red')
+    st.graphviz_chart(dot, use_container_width=True)
 
-            # 6. 刷新地图（动态移动无人机位置）
-            # 根据当前进度插值计算无人机在地图上的坐标
-            curr_lon, curr_lat = route_path[min(current_wp_idx, len(route_path)-1)]
-            if current_wp_idx < len(route_path) - 1:
-                next_lon, next_lat = route_path[current_wp_idx + 1]
-                # 在两点间做线性插值
-                seg_progress = (progress_val / 100) * (total_wp - 1) - current_wp_idx
-                curr_lon += (next_lon - curr_lon) * seg_progress
-                curr_lat += (next_lat - curr_lat) * seg_progress
+    # ====== MAVLink 报文流 ======
+    with st.expander("📨 MAVLink 报文流（最近 50 条）", expanded=True):
+        if st.session_state.mavlink_messages:
+            df_msgs = pd.DataFrame(st.session_state.mavlink_messages[-50:])
+            df_msgs["fields_str"] = df_msgs["fields"].apply(
+                lambda f: ", ".join(f"{k}={v}" for k, v in f.items())
+            )
+            display_df = df_msgs[["seq", "time", "msg_name", "fields_str"]]
+            display_df.columns = ["序号", "时间", "消息类型", "关键字段"]
+            st.dataframe(display_df, use_container_width=True, height=300)
+        else:
+            st.info("暂无报文数据")
 
-            # 在地图上添加/更新“无人机”的标记
-            with map_placeholder.container():
-                # 复制初始地图
-                m2 = folium.Map(location=[route_path[0][1], route_path[0][0]], zoom_start=17,
-                               tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-                               attr='Esri World Imagery')
-                folium.PolyLine(locations=[[pt[1], pt[0]] for pt in route_path], color="#00ff00", weight=4, opacity=0.9).add_to(m2)
-                for j, (lon, lat) in enumerate(route_path):
-                    if j == 0: folium.Marker([lat, lon], icon=folium.Icon(color='red', icon='play', prefix='fa')).add_to(m2)
-                    elif j == len(route_path) - 1: folium.Marker([lat, lon], icon=folium.Icon(color='darkred', icon='times', prefix='fa')).add_to(m2)
-                    else: folium.Marker([lat, lon], icon=folium.Icon(color='red', icon='info-sign', prefix='fa')).add_to(m2)
-                for obs in st.session_state.obstacles:
-                    poly_folium = [[lat, lng] for lng, lat in obs["vertices"]]
-                    folium.Polygon(locations=poly_folium, color="red", weight=3, fill=True, fill_color="red", fill_opacity=0.2).add_to(m2)
-                
-                # 添加动态无人机位置（黑色飞机图标）
-                folium.Marker([curr_lat, curr_lon], popup="当前位置", icon=folium.Icon(color='black', icon='plane', prefix='fa')).add_to(m2)
-                
-                # 渲染出新的地图（强制替换）
-                st_folium(m2, width=700, height=450, returned_objects=[])
-
-            # 7. 刷新 RTT 变化图表（放在 map 下方）
-            with placeholder.container():
-                st.subheader("通讯延迟 (RTT) 变化曲线")
-                st.line_chart(plot_df.set_index("time")["rtt"])
-                if packet['is_timeout']:
-                    st.error(f"警报：北京时间 {packet['time']} 发生通讯超时！")
-                
-                # ---------- MAVLink 报文流展示 ----------
-                with st.expander("📨 MAVLink 报文流（最近 50 条）", expanded=True):
-                    if st.session_state.mavlink_messages:
-                        df_msgs = pd.DataFrame(st.session_state.mavlink_messages[-50:])
-                        df_msgs["fields_str"] = df_msgs["fields"].apply(lambda f: ", ".join(f"{k}={v}" for k, v in f.items()))
-                        display_df = df_msgs[["seq", "time", "msg_name", "fields_str"]]
-                        display_df.columns = ["序号", "时间", "消息类型", "关键字段"]
-                        st.dataframe(display_df, use_container_width=True, height=300)
-                    else:
-                        st.info("暂无报文数据")
-
-            # 你的原生 sleep
-            time.sleep(0.4)
-
-        # 循环结束后重置
-        st.session_state.monitor_active = False
+    # ====== 循环驱动 ======
+    if st.session_state.task_running:
+        time.sleep(0.5)
         st.rerun()
